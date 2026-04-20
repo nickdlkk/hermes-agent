@@ -93,6 +93,31 @@ def get_sandbox_dir() -> Path:
     return p
 
 
+_ACTIVITY_TIMEOUT_WALL_MULTIPLIER = max(
+    1,
+    int(os.getenv("TERMINAL_ACTIVITY_TIMEOUT_WALL_MULTIPLIER", "4")),
+)
+_ACTIVITY_TIMEOUT_WALL_MIN_GRACE_SECONDS = max(
+    0,
+    int(os.getenv("TERMINAL_ACTIVITY_TIMEOUT_WALL_MIN_GRACE_SECONDS", "300")),
+)
+
+
+def _compute_wall_timeout(timeout: int | float) -> float:
+    """Return the hard wall-clock cap for a foreground command timeout.
+
+    ``timeout`` is treated as the foreground command's inactivity budget.
+    Commands that continue producing output can run past that budget, but they
+    still stop at a bounded wall-clock cap so a noisy hung command cannot run
+    forever.
+    """
+    timeout = float(timeout)
+    return max(
+        timeout,
+        timeout * _ACTIVITY_TIMEOUT_WALL_MULTIPLIER,
+        timeout + _ACTIVITY_TIMEOUT_WALL_MIN_GRACE_SECONDS,
+    )
+
 # ---------------------------------------------------------------------------
 # Shared constants and utilities
 # ---------------------------------------------------------------------------
@@ -465,6 +490,7 @@ class BaseEnvironment(ABC):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         def _drain():
+            nonlocal last_output_time, saw_output
             fd = proc.stdout.fileno()
             idle_after_exit = 0
             try:
@@ -480,7 +506,13 @@ class BaseEnvironment(ABC):
                             break
                         if not chunk:
                             break  # true EOF — all writers closed
-                        output_chunks.append(decoder.decode(chunk))
+                        decoded = decoder.decode(chunk)
+                        output_chunks.append(decoded)
+                        # Activity-aware: track output for inactivity timeout
+                        now = time.monotonic()
+                        with activity_lock:
+                            last_output_time = now
+                            saw_output = True
                         idle_after_exit = 0
                     elif proc.poll() is not None:
                         # bash is gone and the pipe was idle for ~100ms.  Give
@@ -508,6 +540,14 @@ class BaseEnvironment(ABC):
             "last_touch": _now,
             "start": _now,
         }
+        # Activity-aware timeout: track last output time for inactivity detection
+        activity_lock = threading.Lock()
+        start_time = time.monotonic()
+        last_output_time = start_time
+        saw_output = False
+        # Hard wall-clock cap for continuously noisy commands
+        wall_timeout = _compute_wall_timeout(timeout)
+        wall_deadline = start_time + wall_timeout
 
         # --- Debug tracing (opt-in via HERMES_DEBUG_INTERRUPT=1) -------------
         # Captures loop entry/exit, interrupt state changes, and periodic
@@ -536,7 +576,7 @@ class BaseEnvironment(ABC):
                         logger.info(
                             "[interrupt-debug] _wait_for_process INTERRUPT DETECTED "
                             "tid=%s pid=%s iter=%d elapsed=%.1fs — killing process group",
-                            _tid, _pid, _iter_count, time.monotonic() - _activity_state["start"],
+                            _tid, _pid, _iter_count, time.monotonic() - start_time,
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
@@ -544,17 +584,43 @@ class BaseEnvironment(ABC):
                         "output": "".join(output_chunks) + "\n[Command interrupted]",
                         "returncode": 130,
                     }
-                if time.monotonic() > deadline:
+                # Check wall deadline first (hard cap for noisy hung commands)
+                if time.monotonic() > wall_deadline:
                     if _DEBUG_INTERRUPT:
                         logger.info(
-                            "[interrupt-debug] _wait_for_process TIMEOUT "
-                            "tid=%s pid=%s iter=%d timeout=%ss",
-                            _tid, _pid, _iter_count, timeout,
+                            "[interrupt-debug] _wait_for_process WALL TIMEOUT "
+                            "tid=%s pid=%s iter=%d wall_timeout=%ss inactivity_timeout=%ss",
+                            _tid, _pid, _iter_count, int(wall_timeout), int(timeout),
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
                     partial = "".join(output_chunks)
-                    timeout_msg = f"\n[Command timed out after {timeout}s]"
+                    timeout_msg = (
+                        f"\n[Command hit hard timeout after {int(wall_timeout)}s "
+                        f"(inactivity timeout {int(timeout)}s)]"
+                    )
+                    return {
+                        "output": partial + timeout_msg
+                        if partial
+                        else timeout_msg.lstrip(),
+                        "returncode": 124,
+                    }
+                # Activity-aware inactivity timeout: reset on new output
+                if time.monotonic() > last_output_time + timeout:
+                    if _DEBUG_INTERRUPT:
+                        logger.info(
+                            "[interrupt-debug] _wait_for_process INACTIVITY TIMEOUT "
+                            "tid=%s pid=%s iter=%d timeout=%ss",
+                            _tid, _pid, _iter_count, int(timeout),
+                        )
+                    self._kill_process(proc)
+                    drain_thread.join(timeout=2)
+                    partial = "".join(output_chunks)
+                    timeout_msg = (
+                        f"\n[Command timed out after {int(timeout)}s without output]"
+                        if saw_output
+                        else f"\n[Command timed out after {int(timeout)}s]"
+                    )
                     return {
                         "output": partial + timeout_msg
                         if partial
@@ -574,7 +640,7 @@ class BaseEnvironment(ABC):
                         "tid=%s pid=%s iter=%d elapsed=%.0fs "
                         "interrupt=%s activity_cb=%s%s",
                         _tid, _pid, _iter_count,
-                        time.monotonic() - _activity_state["start"],
+                        time.monotonic() - start_time,
                         is_interrupted(),
                         "set" if not _cb_now_none else "MISSING",
                         " (LOST during run)" if _cb_now_none and not _cb_was_none else "",
@@ -596,7 +662,7 @@ class BaseEnvironment(ABC):
                     "[interrupt-debug] _wait_for_process EXCEPTION_EXIT "
                     "tid=%s pid=%s iter=%d elapsed=%.1fs — killing subprocess group before re-raise",
                     _tid, _pid, _iter_count,
-                    time.monotonic() - _activity_state["start"],
+                    time.monotonic() - start_time,
                 )
             try:
                 self._kill_process(proc)
@@ -620,7 +686,7 @@ class BaseEnvironment(ABC):
                 "[interrupt-debug] _wait_for_process EXIT (natural) "
                 "tid=%s pid=%s iter=%d elapsed=%.1fs returncode=%s",
                 _tid, _pid, _iter_count,
-                time.monotonic() - _activity_state["start"],
+                time.monotonic() - start_time,
                 proc.returncode,
             )
 
