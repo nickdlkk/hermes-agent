@@ -3392,11 +3392,21 @@ class FeishuAdapter(BasePlatformAdapter):
         return bool(sender_ids and (sender_ids & self._allowed_group_users))
 
     def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
-        """Require an explicit @mention before group messages enter the agent."""
+        """Require an explicit @mention before group messages enter the agent.
+
+        Topic-thread messages (thread_id present) bypass the mention gate — users
+        who explicitly open a topic are intentionally engaging with the bot there,
+        so mention friction is unnecessary.
+        """
         if not self._allow_group_message(sender_id, chat_id):
             return False
         # If require_mention is disabled, accept all group messages that pass policy.
         if not self._feishu_require_mention():
+            return True
+        # Topic-thread messages bypass mention requirement — the user explicitly
+        # chose to interact inside a topic, so @mention is redundant friction.
+        thread_id = getattr(message, "thread_id", None) or None
+        if thread_id:
             return True
         # @_all is Feishu's @everyone placeholder — always route to the bot.
         raw_content = getattr(message, "content", "") or ""
