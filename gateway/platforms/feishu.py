@@ -3690,24 +3690,28 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Any:
         thread_id = (metadata or {}).get("thread_id")
         reply_in_thread = bool(thread_id)
-        effective_reply_to = reply_to or (thread_id if reply_in_thread else None)
-        if effective_reply_to:
+        # Only use the reply API when we have an actual message_id to reply to.
+        # reply_to is the message ID; thread_id is the topic/thread ID.
+        # These are different — we cannot use thread_id as a message_id.
+        if reply_to:
             body = self._build_reply_message_body(
                 content=payload,
                 msg_type=msg_type,
                 reply_in_thread=reply_in_thread,
                 uuid_value=str(uuid.uuid4()),
             )
-            request = self._build_reply_message_request(effective_reply_to, body)
+            request = self._build_reply_message_request(reply_to, body, thread_id=thread_id)
             return await asyncio.to_thread(self._client.im.v1.message.reply, request)
 
+        # No reply_to: use the create API. If thread_id is present, add it as
+        # topic_id so the message is created inside the correct topic thread.
         body = self._build_create_message_body(
             receive_id=chat_id,
             msg_type=msg_type,
             content=payload,
             uuid_value=str(uuid.uuid4()),
         )
-        request = self._build_create_message_request("chat_id", body)
+        request = self._build_create_message_request("chat_id", body, topic_id=thread_id)
         return await asyncio.to_thread(self._client.im.v1.message.create, request)
 
     @staticmethod
@@ -3951,15 +3955,21 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
-    def _build_reply_message_request(message_id: str, request_body: Any) -> Any:
+    def _build_reply_message_request(message_id: str, request_body: Any, thread_id: Optional[str] = None) -> Any:
         if "ReplyMessageRequest" in globals():
-            return (
+            builder = (
                 ReplyMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(request_body)
-                .build()
             )
-        return SimpleNamespace(message_id=message_id, request_body=request_body)
+            req = builder.build()
+            if thread_id:
+                req.add_query("thread_id", thread_id)
+            return req
+        ns = SimpleNamespace(message_id=message_id, request_body=request_body)
+        if thread_id:
+            ns.thread_id = thread_id
+        return ns
 
     @staticmethod
     def _build_update_message_body(*, msg_type: str, content: str) -> Any:
@@ -4002,15 +4012,21 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
-    def _build_create_message_request(receive_id_type: str, request_body: Any) -> Any:
+    def _build_create_message_request(receive_id_type: str, request_body: Any, topic_id: Optional[str] = None) -> Any:
         if "CreateMessageRequest" in globals():
-            return (
+            req = (
                 CreateMessageRequest.builder()
                 .receive_id_type(receive_id_type)
                 .request_body(request_body)
                 .build()
             )
-        return SimpleNamespace(receive_id_type=receive_id_type, request_body=request_body)
+            if topic_id:
+                req.add_query("topic_id", topic_id)
+            return req
+        ns = SimpleNamespace(receive_id_type=receive_id_type, request_body=request_body)
+        if topic_id:
+            ns.topic_id = topic_id
+        return ns
 
     @staticmethod
     def _build_image_upload_body(*, image_type: str, image: Any) -> Any:
