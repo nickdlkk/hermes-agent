@@ -107,6 +107,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
+    ProcessingOutcome,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -118,7 +119,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _MARKDOWN_HINT_RE = re.compile(
-    r"(^#{1,6}\s)|(^\s*[-*]\s)|(^\s*\d+\.\s)|(^\s*---+\s*$)|(```)|(`[^`\n]+`)|(\*\*[^*\n].+?\*\*)|(~~[^~\n].+?~~)|(<u>.+?</u>)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)]+\))|(^>\s)",
+    r"(^#{1,6}\s)|(^\s*[-*]\s)|(^\s*\d+\.\s)|(^\s*---+\s*$)|(```)|(`[^`\n]+`)|(\*\*[^*\n].+?\*\*)|(~~[^~\n].+?~~)|(<u>.+?</u>)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)]+\))|(^>\s)|(^\s*\|.+?\|)",
     re.MULTILINE,
 )
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
@@ -193,8 +194,9 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
 }
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
+_FEISHU_DONE_EMOJI = "DONE"
 
-# Feishu reactions render as prominent badges, unlike Discord/Telegram's
+_FEISHU_BOT_MSG_TRACK_SIZE = 512
 # small footer emoji — a success badge on every message would add noise, so
 # we only mark start (Typing) and failure (CrossMark); the reply itself is
 # the success signal.
@@ -520,6 +522,179 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
 
     _flush_current()
     return rows or [[{"tag": "md", "text": content}]]
+
+
+# ---------------------------------------------------------------------------
+# Markdown table parsing and interactive card building
+# ---------------------------------------------------------------------------
+
+_TABLE_ROW_RE = re.compile(r"^\s*\|", re.MULTILINE)
+_MAX_TABLES_PER_CARD = 5
+
+
+def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
+    """Parse GFM table lines into a Feishu native table component dict."""
+    lines = [ln for ln in table_lines if ln.strip()]
+    if len(lines) < 2:
+        return None
+    sep_idx = None
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*\|[\s\-\:\|]+\|\s*$", ln):
+            sep_idx = i
+            break
+    if sep_idx is None or sep_idx == 0:
+        return None
+
+    def split_row(line: str) -> List[str]:
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            stripped = stripped[1:]
+        if stripped.endswith("|"):
+            stripped = stripped[:-1]
+        return [c.strip() for c in stripped.split("|")]
+
+    headers = split_row(lines[0])
+    if not headers:
+        return None
+    col_keys = [f"col{i}" for i in range(len(headers))]
+
+    def parse_alignment(sep_line: str) -> List[str]:
+        cells = split_row(sep_line)
+        alignments = []
+        for cell in cells:
+            stripped = cell.strip()
+            if stripped.startswith(":") and stripped.endswith(":"):
+                alignments.append("center")
+            elif stripped.endswith(":"):
+                alignments.append("right")
+            else:
+                alignments.append("left")
+        return alignments
+
+    alignments = (
+        parse_alignment(lines[sep_idx])
+        if sep_idx is not None
+        else ["left"] * len(headers)
+    )
+
+    columns = [
+        {
+            "name": col_keys[i],
+            "display_name": headers[i],
+            "width": "auto",
+            "horizontal_align": alignments[i] if i < len(alignments) else "left",
+        }
+        for i in range(len(headers))
+    ]
+    rows = []
+    for line in lines[sep_idx + 1:]:
+        cells = split_row(line)
+        row: Dict[str, Any] = {}
+        for i, key in enumerate(col_keys):
+            cell_text = cells[i] if i < len(cells) else ""
+            cell_text = re.sub(r"[*_]{1,2}(.+?)[*_]{1,2}", r"\1", cell_text)
+            row[key] = cell_text
+        rows.append(row)
+    if not rows:
+        return None
+    return {
+        "tag": "table",
+        "page_size": min(max(len(rows), 10), 50),
+        "row_size": len(rows),
+        "column_size": len(headers),
+        "header_row": {
+            "cells": [{"text": h} for h in headers]
+        },
+        "columns": columns,
+        "rows": rows,
+    }
+
+
+def _convert_md_headings_to_bold(text: str) -> str:
+    """Convert Markdown headings (##, ###, etc.) to bold text."""
+    return re.sub(r"^#{1,6}\s+(.+)$", r"**\1**", text, flags=re.MULTILINE)
+
+
+def _build_card_elements(text: str) -> List[Dict[str, Any]]:
+    """Parse text into a list of card elements (table or markdown)."""
+    lines = text.split("\n")
+    elements: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _TABLE_ROW_RE.match(line):
+            table_block: List[str] = []
+            while i < len(lines) and _TABLE_ROW_RE.match(lines[i]):
+                table_block.append(lines[i])
+                i += 1
+            table_elem = _parse_md_table(table_block)
+            if table_elem:
+                elements.append(table_elem)
+            else:
+                fallback = _convert_md_headings_to_bold("\n".join(table_block))
+                elements.append({"tag": "markdown", "content": fallback})
+        else:
+            text_block: List[str] = []
+            while i < len(lines) and not _TABLE_ROW_RE.match(lines[i]):
+                text_block.append(lines[i])
+                i += 1
+            content = "\n".join(text_block).strip()
+            if content:
+                content = _convert_md_headings_to_bold(content)
+                elements.append({"tag": "markdown", "content": content})
+    if not elements:
+        elements = [{"tag": "markdown", "content": _convert_md_headings_to_bold(text)}]
+    return elements
+
+
+def _split_card_elements(elements: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Split elements into chunks, each with at most _MAX_TABLES_PER_CARD tables."""
+    chunks: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    pending: List[Dict[str, Any]] = []
+    table_count = 0
+    for elem in elements:
+        if elem.get("tag") == "table":
+            if table_count >= _MAX_TABLES_PER_CARD:
+                chunks.append(current)
+                current = list(pending)
+                table_count = 0
+            else:
+                current.extend(pending)
+            pending = []
+            current.append(elem)
+            table_count += 1
+        else:
+            pending.append(elem)
+    current.extend(pending)
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _build_interactive_payload(text: str) -> str:
+    """Build an interactive card JSON with wide_screen_mode for table rendering."""
+    elements = _build_card_elements(text)
+    card = {
+        "config": {"wide_screen_mode": True},
+        "elements": elements,
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
+def _build_interactive_payload_chunks(text: str) -> List[str]:
+    """Build card JSONs, split when table count exceeds the limit."""
+    elements = _build_card_elements(text)
+    chunks = _split_card_elements(elements)
+    return [
+        json.dumps({"config": {"wide_screen_mode": True}, "elements": chunk}, ensure_ascii=False)
+        for chunk in chunks
+    ]
+
+
+def _has_table(content: str) -> bool:
+    """Check if content contains markdown table."""
+    return bool(_TABLE_ROW_RE.search(content))
 
 
 def parse_feishu_post_payload(payload: Any) -> FeishuPostParseResult:
@@ -1123,6 +1298,12 @@ class FeishuAdapter(BasePlatformAdapter):
     # is almost certain.
     _SPLIT_THRESHOLD = 4000
 
+    # Disable streaming edit because tables require interactive cards which
+    # cannot be edited from text/post messages. This causes stream_consumer
+    # to wait for message completion before sending, ensuring tables render
+    # correctly as interactive cards with wide_screen_mode.
+    supports_streaming_edit = False
+
     # =========================================================================
     # Lifecycle — init / settings / connect / disconnect
     # =========================================================================
@@ -1158,6 +1339,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._chat_locks: Dict[str, asyncio.Lock] = {}  # chat_id → lock (per-chat serial processing)
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
+        self._last_sent_message_ids: Dict[str, str] = {}  # chat_id → last message_id (for completion reaction)
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
         self._app_lock_identity: Optional[str] = None
@@ -1453,47 +1635,77 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
 
         try:
-            for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(chunk)
-                try:
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type=msg_type,
-                        payload=payload,
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
-                        raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                if (
-                    msg_type == "post"
-                    and not self._response_succeeded(response)
-                    and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
-                ):
-                    logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                last_response = response
+            # For content with tables, use special chunking that preserves table boundaries
+            if _has_table(formatted):
+                payload_chunks = self._build_outbound_payload_chunks(formatted)
+                for msg_type, payload in payload_chunks:
+                    try:
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type=msg_type,
+                            payload=payload,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    except Exception as exc:
+                        if msg_type != "interactive" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                            raise
+                        logger.warning("[Feishu] Invalid interactive payload rejected by API; falling back to post")
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="post",
+                            payload=_build_markdown_post_payload(_strip_markdown_to_plain_text(formatted)),
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    last_response = response
+            else:
+                # Normal content without tables
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+                for chunk in chunks:
+                    msg_type, payload = self._build_outbound_payload(chunk)
+                    try:
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type=msg_type,
+                            payload=payload,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    except Exception as exc:
+                        if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                            raise
+                        logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="text",
+                            payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    if (
+                        msg_type == "post"
+                        and not self._response_succeeded(response)
+                        and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
+                    ):
+                        logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="text",
+                            payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    last_response = response
 
-            return self._finalize_send_result(last_response, "send failed")
+            result = self._finalize_send_result(last_response, "send failed")
+            # Track last sent message_id for completion reaction
+            if result.success and result.message_id:
+                self._last_sent_message_ids[chat_id] = result.message_id
+            return result
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
@@ -1846,6 +2058,10 @@ class FeishuAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         """Feishu text messages are plain text by default."""
         return content.strip()
+
+    # Note: truncate_message is not overridden here because table content is
+    # handled separately in send() via _build_outbound_payload_chunks.  For
+    # non-table content, the base class truncate_message works correctly.
 
     # =========================================================================
     # Inbound event handlers
@@ -2299,6 +2515,57 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
         await self._handle_message_with_guards(synthetic_event)
+
+    async def _add_done_reaction(self, message_id: str) -> Optional[str]:
+        """Add a DONE emoji reaction to signal the message processing is complete."""
+        if not self._client or not message_id:
+            return None
+        try:
+            from lark_oapi.api.im.v1 import (  # lazy import — keeps optional dep optional
+                CreateMessageReactionRequest,
+                CreateMessageReactionRequestBody,
+            )
+            body = (
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type({"emoji_type": _FEISHU_DONE_EMOJI})
+                .build()
+            )
+            request = (
+                CreateMessageReactionRequest.builder()
+                .message_id(message_id)
+                .request_body(body)
+                .build()
+            )
+            response = await asyncio.to_thread(self._client.im.v1.message_reaction.create, request)
+            if response and getattr(response, "success", lambda: False)():
+                data = getattr(response, "data", None)
+                return getattr(data, "reaction_id", None)
+            logger.debug(
+                "[Feishu] Failed to add done reaction to %s: code=%s msg=%s",
+                message_id,
+                getattr(response, "code", None),
+                getattr(response, "msg", None),
+            )
+        except Exception:
+            logger.debug("[Feishu] Failed to add done reaction to %s", message_id, exc_info=True)
+        return None
+
+    # =========================================================================
+    # Processing lifecycle hooks
+    # =========================================================================
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Add DONE reaction when message processing completes successfully."""
+        if outcome != ProcessingOutcome.SUCCESS:
+            return
+        chat_id = getattr(event.source, "chat_id", "") if event.source else ""
+        if not chat_id:
+            return
+        last_message_id = self._last_sent_message_ids.get(chat_id)
+        if last_message_id:
+            await self._add_done_reaction(last_message_id)
+            # Clear the tracked message_id after adding reaction
+            self._last_sent_message_ids.pop(chat_id, None)
 
     # =========================================================================
     # Per-chat serialization and typing indicator
@@ -3610,10 +3877,21 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+        if _has_table(content):
+            return "interactive", _build_interactive_payload(content)
         if _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
+
+    def _build_outbound_payload_chunks(self, content: str) -> List[tuple[str, str]]:
+        """Build payload chunks for content with multiple tables."""
+        if _has_table(content):
+            chunks = _build_interactive_payload_chunks(content)
+            return [("interactive", chunk) for chunk in chunks]
+        if _MARKDOWN_HINT_RE.search(content):
+            return [("post", _build_markdown_post_payload(content))]
+        return [("text", json.dumps({"text": content}, ensure_ascii=False))]
 
     async def _send_uploaded_file_message(
         self,
@@ -3703,15 +3981,25 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_reply_message_request(reply_to, body, thread_id=thread_id)
             return await asyncio.to_thread(self._client.im.v1.message.reply, request)
 
-        # No reply_to: use the create API. If thread_id is present, add it as
-        # topic_id so the message is created inside the correct topic thread.
-        body = self._build_create_message_body(
-            receive_id=chat_id,
-            msg_type=msg_type,
-            content=payload,
-            uuid_value=str(uuid.uuid4()),
-        )
-        request = self._build_create_message_request("chat_id", body, topic_id=thread_id)
+        # No reply_to: use the create API. If thread_id is present, use it as
+        # receive_id so the message is created inside the correct topic thread.
+        _thread_id = (metadata or {}).get("thread_id")
+        if _thread_id:
+            body = self._build_create_message_body(
+                receive_id=_thread_id,
+                msg_type=msg_type,
+                content=payload,
+                uuid_value=str(uuid.uuid4()),
+            )
+            request = self._build_create_message_request("thread_id", body)
+        else:
+            body = self._build_create_message_body(
+                receive_id=chat_id,
+                msg_type=msg_type,
+                content=payload,
+                uuid_value=str(uuid.uuid4()),
+            )
+            request = self._build_create_message_request("chat_id", body)
         return await asyncio.to_thread(self._client.im.v1.message.create, request)
 
     @staticmethod
