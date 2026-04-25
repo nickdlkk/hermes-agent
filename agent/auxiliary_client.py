@@ -793,6 +793,205 @@ class _AnthropicChatShim:
         self.completions = adapter
 
 
+# ── MiniMax Vision (VLM) adapter ─────────────────────────────────────────────
+
+_MINIMAX_VLM_URL = "https://api.minimaxi.com/v1/coding_plan/vlm"
+
+
+class _MiniMaxVLAdapter:
+    """OpenAI-client-compatible adapter that translates vision calls to MiniMax VLM.
+
+    MiniMax's vision endpoint uses a non-standard format::
+
+        POST /v1/coding_plan/vlm
+        Body: {"model": "MiniMax-M2.7", "prompt": "<text>", "image_url": "<data:...>"}
+
+    Rather than the standard chat.completions image_url block format.
+    This adapter sits in front of a plain OpenAI client and converts the call.
+    """
+
+    def __init__(self, api_key: str, model: str = "MiniMax-M2.7"):
+        self._api_key = api_key
+        self._model = model
+
+    def create(self, **kwargs) -> Any:
+        import json, urllib.request
+
+        messages = kwargs.get("messages", [])
+        # Extract text and first image from the messages
+        text_parts, image_url = self._extract_text_and_image(messages)
+        prompt_text = "\n".join(text_parts) if text_parts else "描述这张图片"
+
+        payload = {
+            "model": self._model,
+            "prompt": prompt_text,
+            "image_url": image_url,
+        }
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            _MINIMAX_VLM_URL,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._api_key}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            raise Exception(f"MiniMax VLM HTTP {e.code}: {body}")
+        except Exception as exc:
+            raise Exception(f"MiniMax VLM request failed: {exc}")
+
+        content = result.get("content", "") or ""
+        # Normalize to OpenAI-style response shape
+        return _MiniMaxVLResponse(content)
+
+    def _extract_text_and_image(self, messages: list) -> tuple:
+        """Return (text_parts, image_url) from OpenAI or Anthropic-format messages list."""
+        text_parts, image_url = [], None
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                if role == "user" and content.strip():
+                    text_parts.append(content.strip())
+            elif isinstance(content, list):
+                for block in content:
+                    btype = block.get("type", "")
+                    if btype == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif btype == "image_url":
+                        # OpenAI format: {"type": "image_url", "image_url": {"url": "..."}}
+                        image_url = block.get("image_url", {})
+                        if isinstance(image_url, dict):
+                            image_url = image_url.get("url", "")
+                    elif btype == "image":
+                        # Anthropic format: {"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}
+                        source = block.get("source", {})
+                        if source.get("type") == "base64":
+                            media_type = source.get("media_type", "image/jpeg")
+                            data = source.get("data", "")
+                            image_url = f"data:{media_type};base64,{data}"
+                        elif source.get("type") == "url":
+                            image_url = source.get("url", "")
+        return text_parts, image_url
+
+
+class _MiniMaxVLResponse:
+    """Normalize MiniMax VLM response to OpenAI chat.completions shape."""
+
+    def __init__(self, content: str):
+        self.content = content
+        self.role = "assistant"
+        self._raw = {"choices": [{"message": {"content": content}}]}
+
+    @property
+    def choices(self):
+        # Return dict-like objects with .message attribute for _validate_llm_response
+        return [_VLChoice(msg) for msg in self._raw["choices"]]
+
+    def model_dump(self, **kwargs) -> dict:
+        return self._raw
+
+    def model_dump_json(self, **kwargs) -> str:
+        import json
+        return json.dumps(self._raw)
+
+
+class _VLChoice:
+    """Minimal choice object with .message attribute for validation."""
+    def __init__(self, choice_dict: dict):
+        self._dict = choice_dict
+        self.message = _VLMessage(choice_dict.get("message", {}))
+
+    def model_dump(self, **kwargs) -> dict:
+        return self._dict
+
+
+class _VLMessage:
+    """Minimal message object with .content attribute."""
+    def __init__(self, msg_dict: dict):
+        self._dict = msg_dict
+        self.content = msg_dict.get("content", "")
+        self.role = msg_dict.get("role", "assistant")
+
+    def model_dump(self, **kwargs) -> dict:
+        return self._dict
+
+
+class AsyncMiniMaxVLAdapter:
+    """Async wrapper for MiniMaxVLAdapter."""
+
+    def __init__(self, sync_adapter: "_MiniMaxVLAdapter"):
+        self._sync = sync_adapter
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+        return await asyncio.to_thread(self._sync.create, **kwargs)
+
+
+class MiniMaxVLClient:
+    """OpenAI-client-compatible sync client that routes vision calls to MiniMax VLM."""
+
+    def __init__(self, api_key: str, model: str = "MiniMax-M2.7"):
+        adapter = _MiniMaxVLAdapter(api_key, model)
+        self.chat = _MiniMaxChatShim(adapter)
+        self.api_key = api_key
+        self.base_url = _MINIMAX_VLM_URL
+
+    def close(self):
+        pass
+
+
+class _MiniMaxChatShim:
+    def __init__(self, adapter: "_MiniMaxVLAdapter"):
+        self.completions = adapter
+
+    def create(self, **kwargs):
+        return self.completions.create(**kwargs)
+
+
+class _AsyncMiniMaxVLClient:
+    """Async OpenAI-client-compatible wrapper for MiniMax VLM."""
+
+    def __init__(self, adapter: "AsyncMiniMaxVLAdapter"):
+        self.chat = _AsyncMiniMaxVLChatShim(adapter)
+        self.api_key = None
+        self.base_url = _MINIMAX_VLM_URL
+
+
+class _AsyncMiniMaxVLChatShim:
+    def __init__(self, adapter: "AsyncMiniMaxVLAdapter"):
+        self.completions = adapter
+
+    async def create(self, **kwargs):
+        return await self.completions.create(**kwargs)
+
+
+def _try_minimax_vision(api_key: str = None) -> Tuple[Any, str]:
+    """Return a MiniMaxVLClient and model name if MiniMax credentials are available."""
+    # If no api_key passed, try to resolve from PROVIDER_REGISTRY
+    if not api_key:
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+            # Try minimax-cn first (user's provider), then global minimax
+            for provider_id in ("minimax-cn", "minimax"):
+                creds = resolve_api_key_provider_credentials(provider_id)
+                api_key = str(creds.get("api_key", "")).strip()
+                if api_key:
+                    break
+        except Exception:
+            pass
+    if not api_key:
+        return None, None
+    model = "MiniMax-M2.7"
+    client = MiniMaxVLClient(api_key=api_key, model=model)
+    return client, model
+
+
 class AnthropicAuxiliaryClient:
     """OpenAI-client-compatible wrapper over a native Anthropic client."""
 
@@ -1891,6 +2090,12 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         return AsyncCodexAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
+    if isinstance(sync_client, MiniMaxVLClient):
+        # MiniMaxVLClient.chat is a _MiniMaxChatShim wrapping _MiniMaxVLAdapter.
+        # Wire up the async counterpart so async callers can await it.
+        async_adapter = AsyncMiniMaxVLAdapter(sync_client.chat.completions)
+        async_client = _AsyncMiniMaxVLClient(async_adapter)
+        return async_client, model
     try:
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
 
@@ -2504,6 +2709,8 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
 _VISION_AUTO_PROVIDER_ORDER = (
     "openrouter",
     "nous",
+    "minimax",
+    "minimax-cn",
 )
 
 
@@ -2531,6 +2738,8 @@ def _resolve_strict_vision_backend(
         return _try_anthropic()
     if provider == "custom":
         return _try_custom_endpoint()
+    if provider in ("minimax", "minimax-cn"):
+        return _try_minimax_vision()
     return None, None
 
 
@@ -2621,7 +2830,7 @@ def resolve_vision_provider_client(
         main_model = _read_main_model()
         if main_provider and main_provider not in ("auto", ""):
             vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
-            if main_provider == "nous":
+            if main_provider in ("nous", "minimax", "minimax-cn"):
                 sync_client, default_model = _resolve_strict_vision_backend(
                     main_provider, vision_model
                 )
