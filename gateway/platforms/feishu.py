@@ -600,7 +600,7 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
         return None
     sep_idx = None
     for i, ln in enumerate(lines):
-        if re.match(r"^\s*\|[\s\-\:\|]+\|\s*$", ln):
+        if re.match(r"^\s*\|[\s\-\:\|\:]+\|\s*$", ln):
             sep_idx = i
             break
     if sep_idx is None or sep_idx == 0:
@@ -614,24 +614,42 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
             stripped = stripped[:-1]
         return [c.strip() for c in stripped.split("|")]
 
+    def clean_text(text: str) -> str:
+        """Strip markdown bold/italic markers and backticks for plain text display."""
+        text = re.sub(r"[*_]{1,2}(.+?)[*_]{1,2}", r"\1", text)
+        text = text.replace("`", "")
+        return text
+
     headers = split_row(lines[0])
     if not headers:
         return None
     col_keys = [f"col{i}" for i in range(len(headers))]
 
-    def make_cell(text: str) -> Dict[str, Any]:
-        """Wrap cell text in lark_md object format required by Feishu card table."""
-        # Strip markdown bold/italic markers AND inline code backticks for plain display
-        clean = re.sub(r"[*_]{1,2}(.+?)[*_]{1,2}", r"\1", text)
-        # Remove ALL backticks (they are markdown inline code syntax, not actual content)
-        clean = clean.replace("`", "")
-        return {"tag": "lark_md", "content": clean}
+    def parse_alignment(sep_line: str) -> List[str]:
+        cells = split_row(sep_line)
+        alignments = []
+        for cell in cells:
+            stripped = cell.strip()
+            if stripped.startswith(":") and stripped.endswith(":"):
+                alignments.append("center")
+            elif stripped.endswith(":"):
+                alignments.append("right")
+            else:
+                alignments.append("left")
+        return alignments
+
+    alignments = (
+        parse_alignment(lines[sep_idx])
+        if sep_idx is not None
+        else ["left"] * len(headers)
+    )
 
     columns = [
         {
             "name": col_keys[i],
             "display_name": headers[i],
             "width": "auto",
+            "horizontal_align": alignments[i] if i < len(alignments) else "left",
         }
         for i in range(len(headers))
     ]
@@ -641,7 +659,7 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
         row: Dict[str, Any] = {}
         for i, key in enumerate(col_keys):
             cell_text = cells[i] if i < len(cells) else ""
-            row[key] = make_cell(cell_text)
+            row[key] = clean_text(cell_text)
         rows.append(row)
     if not rows:
         return None
@@ -651,7 +669,7 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
         "row_size": len(rows),
         "column_size": len(headers),
         "header_row": {
-            "cells": [make_cell(h) for h in headers]
+            "cells": [{"text": clean_text(h)} for h in headers]
         },
         "columns": columns,
         "rows": rows,
