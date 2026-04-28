@@ -64,7 +64,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -1548,7 +1548,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._chat_locks: Dict[str, asyncio.Lock] = {}  # chat_id → lock (per-chat serial processing)
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
-        self._last_sent_message_ids: Dict[str, str] = {}  # chat_id → last message_id (for completion reaction)
+        self._last_sent_message_ids: Dict[Tuple[str, Optional[str]], str] = {}  # (chat_id, thread_id) → last message_id (for completion reaction)
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
         self._app_lock_identity: Optional[str] = None
@@ -1911,9 +1911,12 @@ class FeishuAdapter(BasePlatformAdapter):
                     last_response = response
 
             result = self._finalize_send_result(last_response, "send failed")
-            # Track last sent message_id for completion reaction
+            # Track last sent message_id for completion reaction.
+            # Use composite key (chat_id, thread_id) so topic messages are
+            # keyed consistently with how on_processing_complete looks them up.
             if result.success and result.message_id:
-                self._last_sent_message_ids[chat_id] = result.message_id
+                key = (chat_id, (metadata or {}).get("thread_id"))
+                self._last_sent_message_ids[key] = result.message_id
             return result
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
@@ -2764,19 +2767,6 @@ class FeishuAdapter(BasePlatformAdapter):
     # Processing lifecycle hooks
     # =========================================================================
 
-    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Add DONE reaction when message processing completes successfully."""
-        if outcome != ProcessingOutcome.SUCCESS:
-            return
-        chat_id = getattr(event.source, "chat_id", "") if event.source else ""
-        if not chat_id:
-            return
-        last_message_id = self._last_sent_message_ids.get(chat_id)
-        if last_message_id:
-            await self._add_done_reaction(last_message_id)
-            # Clear the tracked message_id after adding reaction
-            self._last_sent_message_ids.pop(chat_id, None)
-
     # =========================================================================
     # Per-chat serialization and typing indicator
     # =========================================================================
@@ -2918,6 +2908,16 @@ class FeishuAdapter(BasePlatformAdapter):
 
         if outcome is ProcessingOutcome.FAILURE:
             await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
+        elif outcome is ProcessingOutcome.SUCCESS:
+            # Add DONE reaction to the bot's last sent message in this chat.
+            # Use composite key (chat_id, thread_id) matching how send() stores it.
+            chat_id = getattr(event.source, "chat_id", "") if event.source else ""
+            thread_id = getattr(event.source, "thread_id", None)
+            key = (chat_id, thread_id)
+            last_message_id = self._last_sent_message_ids.get(key)
+            if last_message_id:
+                await self._add_done_reaction(last_message_id)
+                self._last_sent_message_ids.pop(key, None)
 
     # =========================================================================
     # Webhook server and security
