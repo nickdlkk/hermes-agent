@@ -621,8 +621,10 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
 
     def make_cell(text: str) -> Dict[str, Any]:
         """Wrap cell text in lark_md object format required by Feishu card table."""
-        # Strip markdown bold/italic markers for plain display
+        # Strip markdown bold/italic markers AND inline code backticks for plain display
         clean = re.sub(r"[*_]{1,2}(.+?)[*_]{1,2}", r"\1", text)
+        # Remove ALL backticks (they are markdown inline code syntax, not actual content)
+        clean = clean.replace("`", "")
         return {"tag": "lark_md", "content": clean}
 
     columns = [
