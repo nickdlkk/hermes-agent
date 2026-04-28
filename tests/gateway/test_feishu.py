@@ -2775,9 +2775,10 @@ class TestAdapterBehavior(unittest.TestCase):
         table_elem = next(e for e in elements if e.get("tag") == "table")
         columns = table_elem.get("columns", [])
         self.assertEqual(len(columns), 3)
-        self.assertEqual(columns[0].get("horizontal_align"), "left")
-        self.assertEqual(columns[1].get("horizontal_align"), "center")
-        self.assertEqual(columns[2].get("horizontal_align"), "right")
+        # horizontal_align is not supported in Feishu Card table columns
+        self.assertIsNone(columns[0].get("horizontal_align"))
+        self.assertIsNone(columns[1].get("horizontal_align"))
+        self.assertIsNone(columns[2].get("horizontal_align"))
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_mixed_table_and_text(self):

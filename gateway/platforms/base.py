@@ -2467,6 +2467,10 @@ class BasePlatformAdapter(ABC):
                             pass
 
                 # Send the text portion
+                _response_meta = getattr(event, "_hermes_response_meta", None) if event else None
+                if _response_meta:
+                    _thread_metadata = _thread_metadata or {}
+                    _thread_metadata["_hermes_response_meta"] = _response_meta
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     result = await self._send_with_retry(
