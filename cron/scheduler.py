@@ -233,12 +233,32 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
     }
 
 
+def _normalize_deliver_value(deliver) -> str:
+    """Normalize a stored/submitted ``deliver`` value to its canonical string form.
+
+    The contract is that ``deliver`` is a string (``"local"``, ``"origin"``,
+    ``"telegram"``, ``"telegram:-1001:17"``, or comma-separated combinations).
+    Historically some callers — MCP clients passing an array, direct edits of
+    ``jobs.json``, or stale code paths — have stored a list/tuple like
+    ``["telegram"]``.  ``str(["telegram"])`` would serialize to the literal
+    string ``"['telegram']"``, which is not a known platform and fails
+    resolution silently.  Flatten lists/tuples into a comma-separated string
+    so both forms work.  Returns ``"local"`` for anything falsy.
+    """
+    if deliver is None or deliver == "":
+        return "local"
+    if isinstance(deliver, (list, tuple)):
+        parts = [str(p).strip() for p in deliver if str(p).strip()]
+        return ",".join(parts) if parts else "local"
+    return str(deliver)
+
+
 def _resolve_delivery_targets(job: dict) -> List[dict]:
     """Resolve all concrete auto-delivery targets for a cron job (supports comma-separated deliver)."""
-    deliver = job.get("deliver", "local")
+    deliver = _normalize_deliver_value(job.get("deliver", "local"))
     if deliver == "local":
         return []
-    parts = [p.strip() for p in str(deliver).split(",") if p.strip()]
+    parts = [p.strip() for p in deliver.split(",") if p.strip()]
     seen = set()
     targets = []
     for part in parts:
@@ -1013,10 +1033,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
             disabled_toolsets=["cronjob", "messaging", "clarify"],
             quiet_mode=True,
-            # When a workdir is configured, inject AGENTS.md / CLAUDE.md /
-            # .cursorrules from that directory; otherwise preserve the old
-            # behaviour (don't inject SOUL.md/AGENTS.md from the scheduler cwd).
+            # Cron jobs should always inherit the user's SOUL.md identity from
+            # HERMES_HOME. When a workdir is configured, also inject project
+            # context files (AGENTS.md / CLAUDE.md / .cursorrules) from there.
+            # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
+            load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
             platform="cron",
             session_id=_cron_session_id,

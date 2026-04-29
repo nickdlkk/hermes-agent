@@ -1509,3 +1509,232 @@ class TestAuxiliaryAuthRefreshRetry:
         mock_refresh.assert_called_once_with("anthropic")
         assert stale_client.chat.completions.create.await_count == 1
         assert fresh_client.chat.completions.create.await_count == 1
+
+
+class TestCodexAdapterReasoningTranslation:
+    """Verify _CodexCompletionsAdapter translates extra_body.reasoning
+    into the Responses API's top-level reasoning + include fields, matching
+    agent/transports/codex.py::build_kwargs() behavior.
+
+    Regression for user feedback (Apr 26): auxiliary callers that configure
+    reasoning via auxiliary.<task>.extra_body.reasoning had that config
+    silently dropped because the adapter only forwarded messages/model/tools.
+    """
+
+    @staticmethod
+    def _build_adapter():
+        """Build a _CodexCompletionsAdapter with a mocked responses.stream()."""
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+        from types import SimpleNamespace
+
+        # Mock the stream context manager: yields no events, get_final_response
+        # returns a minimal empty-output response.
+        fake_final = SimpleNamespace(
+            output=[SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="hi")],
+            )],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+        )
+
+        class _FakeStream:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def __iter__(self): return iter([])
+            def get_final_response(self): return fake_final
+
+        captured_kwargs = {}
+
+        def _stream(**kwargs):
+            captured_kwargs.update(kwargs)
+            return _FakeStream()
+
+        real_client = MagicMock()
+        real_client.responses.stream = _stream
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
+        return adapter, captured_kwargs
+
+    def test_reasoning_effort_medium_translated_to_top_level(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "medium"}},
+        )
+        assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
+        assert captured.get("include") == ["reasoning.encrypted_content"]
+
+    def test_reasoning_effort_minimal_clamped_to_low(self):
+        """Codex backend rejects 'minimal'; adapter clamps to 'low' per main transport."""
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "minimal"}},
+        )
+        assert captured.get("reasoning") == {"effort": "low", "summary": "auto"}
+        assert captured.get("include") == ["reasoning.encrypted_content"]
+
+    def test_reasoning_effort_low_passed_through(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "low"}},
+        )
+        assert captured.get("reasoning") == {"effort": "low", "summary": "auto"}
+
+    def test_reasoning_effort_high_passed_through(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "high"}},
+        )
+        assert captured.get("reasoning") == {"effort": "high", "summary": "auto"}
+
+    def test_reasoning_disabled_omits_reasoning_and_include(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"enabled": False}},
+        )
+        assert "reasoning" not in captured
+        assert "include" not in captured
+
+    def test_reasoning_default_effort_when_only_enabled_flag(self):
+        """extra_body={"reasoning": {}} (truthy enabled by omission) → default 'medium'."""
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {}},
+        )
+        assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
+        assert captured.get("include") == ["reasoning.encrypted_content"]
+
+    def test_no_extra_body_means_no_reasoning_keys(self):
+        """Baseline: without extra_body, no reasoning/include is sent (preserves
+        current behavior for callers that don't opt in)."""
+        adapter, captured = self._build_adapter()
+        adapter.create(messages=[{"role": "user", "content": "hi"}])
+        assert "reasoning" not in captured
+        assert "include" not in captured
+
+    def test_extra_body_without_reasoning_key_is_noop(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"metadata": {"source": "test"}},
+        )
+        assert "reasoning" not in captured
+        assert "include" not in captured
+
+    def test_non_dict_reasoning_value_is_ignored_gracefully(self):
+        """Defensive: if a caller accidentally passes a string/None, we
+        silently skip instead of crashing inside the adapter."""
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": "medium"},  # wrong shape — must not crash
+        )
+        assert "reasoning" not in captured
+
+
+
+class TestVisionAutoSkipsKimiCoding:
+    """_resolve_auto vision branch skips providers that have no vision on
+    their main endpoint (e.g. Kimi Coding Plan /coding) and falls through
+    to the aggregator chain instead of handing back a client that will 404
+    on every request (#17076).
+    """
+
+    def test_kimi_coding_skipped_falls_through_to_openrouter(self, monkeypatch):
+        """kimi-coding as main + vision auto → OpenRouter (not kimi)."""
+        fake_or_client = MagicMock(name="openrouter_client")
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "kimi-coding",
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_model", lambda: "kimi-code",
+        )
+        # Guard: if the skip doesn't fire, _resolve_strict_vision_backend
+        # and resolve_provider_client both would try kimi-coding — detect
+        # either via the main-provider call and fail loud.
+        rpc_mock = MagicMock(side_effect=AssertionError(
+            "resolve_provider_client should NOT be called for kimi-coding "
+            "on the vision auto path"))
+        monkeypatch.setattr(
+            "agent.auxiliary_client.resolve_provider_client", rpc_mock,
+        )
+
+        def fake_strict(provider, model=None):
+            if provider == "openrouter":
+                return fake_or_client, "google/gemini-3-flash-preview"
+            if provider == "nous":
+                return None, None
+            raise AssertionError(
+                f"strict vision backend should not be called for {provider!r} "
+                "when main provider is kimi-coding"
+            )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._resolve_strict_vision_backend",
+            fake_strict,
+        )
+
+        provider, client, model = resolve_vision_provider_client()
+        assert provider == "openrouter"
+        assert client is fake_or_client
+        assert model == "google/gemini-3-flash-preview"
+
+    def test_kimi_coding_cn_skipped_too(self, monkeypatch):
+        """Same skip applies to the CN variant."""
+        fake_or_client = MagicMock(name="openrouter_client")
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "kimi-coding-cn",
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_model", lambda: "kimi-code",
+        )
+        rpc_mock = MagicMock(side_effect=AssertionError(
+            "resolve_provider_client should NOT be called for kimi-coding-cn"))
+        monkeypatch.setattr(
+            "agent.auxiliary_client.resolve_provider_client", rpc_mock,
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._resolve_strict_vision_backend",
+            lambda p, m=None: (fake_or_client, "gemini")
+            if p == "openrouter"
+            else (None, None),
+        )
+
+        provider, client, _ = resolve_vision_provider_client()
+        assert provider == "openrouter"
+        assert client is fake_or_client
+
+    def test_explicit_override_to_kimi_coding_still_honored(self, monkeypatch):
+        """When a user *explicitly* requests kimi-coding for vision (e.g.
+        they know what they're doing, or are running a future build that
+        adds image_in capability to Kimi Code), the explicit path still
+        routes to kimi-coding — only the auto branch applies the skip.
+        """
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "openrouter",
+        )
+        fake_kimi_client = MagicMock(name="kimi_client")
+        gcc_mock = MagicMock(return_value=(fake_kimi_client, "kimi-code"))
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_cached_client", gcc_mock,
+        )
+
+        provider, client, model = resolve_vision_provider_client(
+            provider="kimi-coding",
+        )
+        assert provider == "kimi-coding"
+        assert client is fake_kimi_client
+        gcc_mock.assert_called_once()
+
+    def test_skip_set_covers_exactly_known_entries(self):
+        """Guard against accidental widening of the skip list."""
+        from agent.auxiliary_client import _PROVIDERS_WITHOUT_VISION
+        assert _PROVIDERS_WITHOUT_VISION == frozenset({
+            "kimi-coding",
+            "kimi-coding-cn",
+        })
