@@ -1112,6 +1112,18 @@ def _maybe_wrap_anthropic(
     if not should_wrap:
         return client_obj
 
+    # MiniMax text models (e.g. MiniMax-M2.7) do not support the Anthropic
+    # Messages API — their /anthropic endpoint only works for vision tasks
+    # (MiniMaxVLClient).  Rewriting to /v1 lets them use OpenAI chat completions.
+    model_lower = (model or "").lower()
+    if "minimax" in base_url.lower() and model_lower == "minimax-m2.7":
+        rewritten_base = _to_openai_base_url(base_url)
+        logger.debug(
+            "Auxiliary transport: MiniMax text model %r on /anthropic endpoint "
+            "— rewriting to OpenAI chat completions (%s)",
+            model, rewritten_base)
+        return client_obj  # already a plain OpenAI client from line ~1291
+
     try:
         from agent.anthropic_adapter import build_anthropic_client
     except ImportError:
