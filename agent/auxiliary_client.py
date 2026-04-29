@@ -2131,7 +2131,9 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
 def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
     """Normalize a resolved model for the provider that will receive it."""
     if not model_name:
-        return model_name
+        # Fall back to the user's configured main model instead of returning
+        # an empty string, which would cause API errors (404 / model not found).
+        return _read_main_model() or None
     try:
         from hermes_cli.model_normalize import normalize_model_for_provider
 
