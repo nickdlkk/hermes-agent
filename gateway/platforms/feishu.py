@@ -621,34 +621,10 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
         # Strip backticks (inline code)
         text = text.replace("`", "")
         # Strip map[content:...tag:lark_md] artifacts that LLM may emit as literal cell text
-        # Pattern: map[content:<path> tag:lark_md] → extract <path>
-        # Handle nested brackets by working inside-out
-        while True:
-            # Find outermost map[...tag:lark_md] block
-            start = text.find("map[content:")
-            if start == -1:
-                break
-            # Find the closing ] for the outermost map bracket
-            # Start from the opening [
-            depth = 0
-            end = start
-            for i in range(start, len(text)):
-                if text[i] == "[":
-                    depth += 1
-                elif text[i] == "]":
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-            if depth == 0 and end > start:
-                # Extract content between "map[content:" and " tag:lark_md]" (exclusive)
-                inner = text[start + len("map[content:") : end]
-                # Remove trailing " tag:lark_md" if present (it's inside the extracted inner)
-                if inner.endswith(" tag:lark_md"):
-                    inner = inner[: -len(" tag:lark_md")]
-                text = text[:start] + inner + text[end + 1 :]
-            else:
-                break
+        # Pattern: map[content:<anything> tag:lark_md] → extract <anything>
+        # Use regex to handle any characters (including extra spaces, nested brackets) between "map[content:" and " tag:lark_md]"
+        # The LLM sometimes emits: map[content:`path` tag:lark_md] or map[content: path  tag:lark_md]
+        text = re.sub(r"map\[content:\s*(.*?)\s*tag:lark_md\]", r"\1", text)
         return text
 
     def make_cell(text: str) -> Dict[str, Any]:
