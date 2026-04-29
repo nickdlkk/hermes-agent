@@ -627,63 +627,45 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
         text = re.sub(r"map\[content:\s*(.*?)\s*tag:lark_md\]", r"\1", text)
         return text
 
-    def make_cell(text: str) -> Dict[str, Any]:
-        """Wrap cleaned text in Feishu table cell format."""
-        return {"text": clean_text(text)}
-
-    headers = split_row(lines[0])
+    headers = [clean_text(h) for h in split_row(lines[0])]
     if not headers:
         return None
     col_keys = [f"col{i}" for i in range(len(headers))]
-
-    def parse_alignment(sep_line: str) -> List[str]:
-        cells = split_row(sep_line)
-        alignments = []
-        for cell in cells:
-            stripped = cell.strip()
-            if stripped.startswith(":") and stripped.endswith(":"):
-                alignments.append("center")
-            elif stripped.endswith(":"):
-                alignments.append("right")
-            else:
-                alignments.append("left")
-        return alignments
-
-    alignments = (
-        parse_alignment(lines[sep_idx])
-        if sep_idx is not None
-        else ["left"] * len(headers)
-    )
 
     columns = [
         {
             "name": col_keys[i],
             "display_name": headers[i],
+            "data_type": "text",
             "width": "auto",
-            "horizontal_align": alignments[i] if i < len(alignments) else "left",
         }
         for i in range(len(headers))
     ]
+
     rows = []
     for line in lines[sep_idx + 1:]:
         cells = split_row(line)
         row: Dict[str, Any] = {}
         for i, key in enumerate(col_keys):
-            cell_text = cells[i] if i < len(cells) else ""
-            row[key] = make_cell(cell_text)
+            cell_text = clean_text(cells[i]) if i < len(cells) else ""
+            row[key] = cell_text or " "
         rows.append(row)
+
     if not rows:
         return None
+
     return {
         "tag": "table",
-        "page_size": min(max(len(rows), 10), 50),
-        "row_size": len(rows),
-        "column_size": len(headers),
-        "header_row": {
-            "cells": [{"text": clean_text(h)} for h in headers]
-        },
         "columns": columns,
         "rows": rows,
+        "header_style": {
+            "bold": True,
+            "text_align": "left",
+            "text_size": "normal",
+            "background_style": "none",
+            "text_color": "default",
+            "lines": 1,
+        },
     }
 
 
