@@ -1919,18 +1919,19 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_interactive_card_payload(
-        *, title: str, template: str, elements: List[Dict[str, Any]]
+        *, title: str = "", template: str = "blue", elements: List[Dict[str, Any]]
     ) -> str:
         card = {
             "schema": "2.0",
             "config": {"update_multi": True, "width_mode": "fill"},
-            "header": {"title": {"content": title, "tag": "plain_text"}, "template": template},
             "body": {"elements": elements or [{"tag": "markdown", "content": " "}]},
         }
+        if title:
+            card["header"] = {"title": {"content": title, "tag": "plain_text"}, "template": template}
         return json.dumps(card, ensure_ascii=False)
 
     def _build_default_reply_card_payload(
-        self, content: str, *, title: str = "Hermes · 回复", template: str = "blue"
+        self, content: str, *, title: str = "", template: str = "blue"
     ) -> str:
         body = content.strip() or " "
         return self._build_interactive_card_payload(
@@ -1949,7 +1950,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return f"**{title}**\n{body}"
 
     def _build_table_card_payload(
-        self, content: str, *, title: str = "Hermes · 回复", template: str = "blue"
+        self, content: str, *, title: str = "", template: str = "blue"
     ) -> str:
         """Build a CardKit v2 table card using local _build_card_elements (which calls _parse_md_table → clean_text)."""
         elements = _build_card_elements(content)
