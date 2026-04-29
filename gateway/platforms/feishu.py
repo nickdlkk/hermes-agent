@@ -620,6 +620,10 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
         text = text.replace("`", "")
         return text
 
+    def make_cell(text: str) -> Dict[str, Any]:
+        """Wrap cleaned text in Feishu table cell format."""
+        return {"text": clean_text(text)}
+
     headers = split_row(lines[0])
     if not headers:
         return None
@@ -659,7 +663,7 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
         row: Dict[str, Any] = {}
         for i, key in enumerate(col_keys):
             cell_text = cells[i] if i < len(cells) else ""
-            row[key] = clean_text(cell_text)
+            row[key] = make_cell(cell_text)
         rows.append(row)
     if not rows:
         return None
