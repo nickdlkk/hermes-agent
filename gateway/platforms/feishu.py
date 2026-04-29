@@ -615,9 +615,40 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
         return [c.strip() for c in stripped.split("|")]
 
     def clean_text(text: str) -> str:
-        """Strip markdown bold/italic markers and backticks for plain text display."""
+        """Strip markdown bold/italic markers, backticks, and map[content:...] artifacts."""
+        # Strip markdown bold/italic
         text = re.sub(r"[*_]{1,2}(.+?)[*_]{1,2}", r"\1", text)
+        # Strip backticks (inline code)
         text = text.replace("`", "")
+        # Strip map[content:...tag:lark_md] artifacts that LLM may emit as literal cell text
+        # Pattern: map[content:<path> tag:lark_md] → extract <path>
+        # Handle nested brackets by working inside-out
+        while True:
+            # Find outermost map[...tag:lark_md] block
+            start = text.find("map[content:")
+            if start == -1:
+                break
+            # Find the closing ] for the outermost map bracket
+            # Start from the opening [
+            depth = 0
+            end = start
+            for i in range(start, len(text)):
+                if text[i] == "[":
+                    depth += 1
+                elif text[i] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if depth == 0 and end > start:
+                # Extract content between "map[content:" and " tag:lark_md]" (exclusive)
+                inner = text[start + len("map[content:") : end]
+                # Remove trailing " tag:lark_md" if present (it's inside the extracted inner)
+                if inner.endswith(" tag:lark_md"):
+                    inner = inner[: -len(" tag:lark_md")]
+                text = text[:start] + inner + text[end + 1 :]
+            else:
+                break
         return text
 
     def make_cell(text: str) -> Dict[str, Any]:
