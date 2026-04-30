@@ -1112,11 +1112,13 @@ def _maybe_wrap_anthropic(
     if not should_wrap:
         return client_obj
 
-    # MiniMax text models (e.g. MiniMax-M2.7) do not support the Anthropic
-    # Messages API — their /anthropic endpoint only works for vision tasks
-    # (MiniMaxVLClient).  Rewriting to /v1 lets them use OpenAI chat completions.
+    # All MiniMax text models (M2/M2.1/M2.5/M2.7/highspeed, future M3/M4, etc.)
+    # do not support the Anthropic Messages API — their /anthropic endpoint only
+    # works for vision tasks (MiniMaxVLClient).  Rewriting to /v1 lets them use
+    # OpenAI chat completions.  Only skip the wrap if the model name starts with
+    # "minimax-m" (excludes MiniMaxVL vision models).
     model_lower = (model or "").lower()
-    if "minimax" in base_url.lower() and model_lower == "minimax-m2.7":
+    if "minimax" in base_url.lower() and model_lower.startswith("minimax-m"):
         rewritten_base = _to_openai_base_url(base_url)
         logger.debug(
             "Auxiliary transport: MiniMax text model %r on /anthropic endpoint "
