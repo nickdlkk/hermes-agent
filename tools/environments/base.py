@@ -554,22 +554,23 @@ class BaseEnvironment(ABC):
                 except Exception:
                     pass
 
-        drain_thread = threading.Thread(target=_drain, daemon=True)
-        drain_thread.start()
-        deadline = time.monotonic() + timeout
+        # Initialize activity tracking variables BEFORE the drain thread starts,
+        # so the lock exists when the thread tries to acquire it immediately.
+        activity_lock = threading.Lock()
+        start_time = time.monotonic()
+        last_output_time = start_time
+        saw_output = False
+        wall_timeout = _compute_wall_timeout(timeout)
+        wall_deadline = start_time + wall_timeout
         _now = time.monotonic()
         _activity_state = {
             "last_touch": _now,
             "start": _now,
         }
-        # Activity-aware timeout: track last output time for inactivity detection
-        activity_lock = threading.Lock()
-        start_time = time.monotonic()
-        last_output_time = start_time
-        saw_output = False
-        # Hard wall-clock cap for continuously noisy commands
-        wall_timeout = _compute_wall_timeout(timeout)
-        wall_deadline = start_time + wall_timeout
+
+        drain_thread = threading.Thread(target=_drain, daemon=True)
+        drain_thread.start()
+        deadline = time.monotonic() + timeout
 
         # --- Debug tracing (opt-in via HERMES_DEBUG_INTERRUPT=1) -------------
         # Captures loop entry/exit, interrupt state changes, and periodic
