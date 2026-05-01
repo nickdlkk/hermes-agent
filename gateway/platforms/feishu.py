@@ -2539,9 +2539,14 @@ class FeishuAdapter(BasePlatformAdapter):
                     override_error="Feishu image upload missing image_key",
                 )
 
-            if caption:
+            _thread_id = (metadata or {}).get("thread_id")
+            # When thread_id is present but reply_to is not, Feishu's native
+            # image message type does not support receive_id=thread_id — fall
+            # back to a post payload that wraps the image_key.
+            _use_post = bool(_thread_id and not reply_to)
+            if caption or _use_post:
                 post_payload = self._build_media_post_payload(
-                    caption=caption,
+                    caption=caption or "",
                     media_tag={"tag": "img", "image_key": image_key},
                 )
                 message_response = await self._feishu_send_with_retry(
