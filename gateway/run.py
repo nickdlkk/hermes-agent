@@ -5985,6 +5985,24 @@ class GatewayRunner:
             if _footer_line and response and not agent_result.get("already_sent"):
                 response = f"{response}\n\n{_footer_line}"
 
+            # Attach response metadata for platform-specific footer rendering
+            # (e.g. feishu.py reads _hermes_response_meta to append model/usage
+            # info as a card footer element instead of plain text).
+            try:
+                _ctx_tokens = agent_result.get("last_prompt_tokens", 0) or 0
+                _ctx_limit = agent_result.get("context_length", 0) or 0
+                _ctx_pct = round(_ctx_tokens / _ctx_limit * 100) if _ctx_limit else 0
+                event._hermes_response_meta = {
+                    "model": agent_result.get("model") or "unknown",
+                    "api_calls": agent_result.get("api_calls", 0),
+                    "context_tokens": _ctx_tokens,
+                    "context_limit": _ctx_limit,
+                    "context_pct": _ctx_pct,
+                    "compressions": agent_result.get("compression_count", 0),
+                }
+            except Exception as _meta_err:
+                logger.debug("Failed to set _hermes_response_meta: %s", _meta_err)
+
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,

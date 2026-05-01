@@ -1968,11 +1968,14 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _payload_invalid_for_msg_type(msg_type: str, message: str) -> bool:
+        # Any "content format … is incorrect" means the payload shape was
+        # rejected by the Feishu API — the fallback sequence should continue.
         if msg_type == "interactive":
-            return bool(_INTERACTIVE_CONTENT_INVALID_RE.search(message or ""))
+            return bool(_INTERACTIVE_CONTENT_INVALID_RE.search(message or "")
+                        or _POST_CONTENT_INVALID_RE.search(message or ""))
         if msg_type == "post":
             return bool(_POST_CONTENT_INVALID_RE.search(message or ""))
-        return False
+        return bool(re.search(r"content format.*is incorrect", message or "", re.IGNORECASE))
 
     @staticmethod
     def _build_interactive_card_payload(
@@ -2050,25 +2053,47 @@ class FeishuAdapter(BasePlatformAdapter):
         self._render_state_by_message_id.move_to_end(message_id)
         return dict(state)
 
-    def _append_card_footer(
-        self, payload: str, _response_meta: Optional[Dict[str, Any]]
-    ) -> str:
-        """Append model/usage footer to a CardKit v2 interactive card payload."""
-        if not _response_meta:
-            return payload
-        footer_text = (
+    @staticmethod
+    def _footer_text(_response_meta: Dict[str, Any]) -> str:
+        """Build the model/usage footer string from response metadata."""
+        return (
             f"Model: {_response_meta['model']} · "
             f"API calls: {_response_meta['api_calls']} · "
             f"Context: {_response_meta['context_tokens']:,} / {_response_meta['context_limit']:,} "
             f"({_response_meta['context_pct']}%) · "
             f"Compressions: {_response_meta['compressions']}"
         )
+
+    def _append_card_footer(
+        self, payload: str, _response_meta: Optional[Dict[str, Any]]
+    ) -> str:
+        """Append model/usage footer to a CardKit v2 interactive card payload."""
+        if not _response_meta:
+            return payload
         card = json.loads(payload)
         card.setdefault("body", {}).setdefault("elements", []).extend([
             {"tag": "hr"},
-            {"tag": "markdown", "content": footer_text},
+            {"tag": "markdown", "content": self._footer_text(_response_meta)},
         ])
         return json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def _append_post_footer(payload: str, _response_meta: Dict[str, Any]) -> str:
+        """Append model/usage footer to a post (rich text) payload."""
+        footer = FeishuAdapter._footer_text(_response_meta)
+        p = json.loads(payload)
+        p.get("zh_cn", p.get("en_us", {})).setdefault("content", []).append(
+            {"tag": "paragraph", "elements": [{"tag": "plain_text", "content": footer}]}
+        )
+        return json.dumps(p, ensure_ascii=False)
+
+    @staticmethod
+    def _append_text_footer(payload: str, _response_meta: Dict[str, Any]) -> str:
+        """Append model/usage footer to a plain text payload."""
+        footer = FeishuAdapter._footer_text(_response_meta)
+        p = json.loads(payload)
+        p["text"] = (p.get("text") or "") + "\n\n" + footer
+        return json.dumps(p, ensure_ascii=False)
 
     def _build_fallback_outbound_sequence(
         self,
@@ -2167,10 +2192,13 @@ class FeishuAdapter(BasePlatformAdapter):
                         if msg_type != "interactive" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
                             raise
                         logger.warning("[Feishu] Invalid interactive payload rejected by API; falling back to post")
+                        _post_payload = _build_markdown_post_payload(_strip_markdown_to_plain_text(formatted))
+                        if _response_meta:
+                            _post_payload = self._append_post_footer(_post_payload, _response_meta)
                         response = await self._feishu_send_with_retry(
                             chat_id=chat_id,
                             msg_type="post",
-                            payload=_build_markdown_post_payload(_strip_markdown_to_plain_text(formatted)),
+                            payload=_post_payload,
                             reply_to=reply_to,
                             metadata=metadata,
                         )
@@ -2186,9 +2214,14 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     ):
                         logger.info("[Feishu] fallback trial msg_type=%s content_len=%d render_state=%s", msg_type, len(payload), render_state)
-                        # Append footer before sending interactive payloads
-                        if msg_type == "interactive" and _response_meta:
-                            payload = self._append_card_footer(payload, _response_meta)
+                        # Append footer before sending
+                        if _response_meta:
+                            if msg_type == "interactive":
+                                payload = self._append_card_footer(payload, _response_meta)
+                            elif msg_type == "post":
+                                payload = self._append_post_footer(payload, _response_meta)
+                            elif msg_type == "text":
+                                payload = self._append_text_footer(payload, _response_meta)
                         try:
                             response = await self._feishu_send_with_retry(
                                 chat_id=chat_id,
