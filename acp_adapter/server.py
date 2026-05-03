@@ -669,24 +669,38 @@ class HermesACPAgent(acp.Agent):
         if not has_content:
             return PromptResponse(stop_reason="end_turn")
 
-        # Zed currently interrupts an active ACP request before delivering a
-        # follow-up slash command. If that follow-up is /steer, there may be no
-        # live AIAgent left to steer by the time this method runs. Salvage that
-        # UX by replaying the interrupted prompt with the steer text attached as
-        # explicit correction/guidance.
+        # /steer on an idle session has no in-flight tool call to inject into.
+        # Rewrite it so the payload runs as a normal user prompt, matching the
+        # gateway's behavior (gateway/run.py ~L4898). Two sub-cases:
+        #   1. Zed-interrupt salvage — a prior prompt was cancelled by the
+        #      client right before /steer arrived; replay it with the steer
+        #      text attached as explicit correction/guidance so the user's
+        #      in-flight work isn't lost.
+        #   2. Plain idle — no prior work to salvage; just run the steer
+        #      payload as a regular prompt. Without this, _cmd_steer would
+        #      silently append to state.queued_prompts and respond with
+        #      "No active turn — queued for the next turn", which looks like
+        #      /queue even though the user never typed /queue.
         if isinstance(user_content, str) and user_text.startswith("/steer"):
             steer_text = user_text.split(maxsplit=1)[1].strip() if len(user_text.split(maxsplit=1)) > 1 else ""
             interrupted_prompt = ""
+            rewrite_idle = False
             with state.runtime_lock:
-                if not state.is_running and steer_text and state.interrupted_prompt_text:
-                    interrupted_prompt = state.interrupted_prompt_text
-                    state.interrupted_prompt_text = ""
+                if not state.is_running and steer_text:
+                    if state.interrupted_prompt_text:
+                        interrupted_prompt = state.interrupted_prompt_text
+                        state.interrupted_prompt_text = ""
+                    else:
+                        rewrite_idle = True
             if interrupted_prompt:
                 user_text = (
                     f"{interrupted_prompt}\n\n"
                     f"User correction/guidance after interrupt: {steer_text}"
                 )
                 user_content = user_text
+            elif rewrite_idle:
+                user_text = steer_text
+                user_content = steer_text
 
         # Intercept slash commands — handle locally without calling the LLM.
         # Slash commands are text-only; if the client included images/resources,
@@ -1054,10 +1068,16 @@ class HermesACPAgent(acp.Agent):
             if not hasattr(agent, "_compress_context"):
                 return "Context compression not available for this agent."
 
-            from agent.model_metadata import estimate_messages_tokens_rough
+            from agent.model_metadata import estimate_request_tokens_rough
 
             original_count = len(state.history)
-            approx_tokens = estimate_messages_tokens_rough(state.history)
+            # Include system prompt + tool schemas so the figure reflects real
+            # request pressure, not a transcript-only underestimate (#6217).
+            _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+            _tools = getattr(agent, "tools", None) or None
+            approx_tokens = estimate_request_tokens_rough(
+                state.history, system_prompt=_sys_prompt, tools=_tools
+            )
             original_session_db = getattr(agent, "_session_db", None)
 
             try:
@@ -1077,7 +1097,13 @@ class HermesACPAgent(acp.Agent):
             self.session_manager.save_session(state.session_id)
 
             new_count = len(state.history)
-            new_tokens = estimate_messages_tokens_rough(state.history)
+            _sys_prompt_after = getattr(agent, "_cached_system_prompt", "") or _sys_prompt
+            _tools_after = getattr(agent, "tools", None) or _tools
+            new_tokens = estimate_request_tokens_rough(
+                state.history,
+                system_prompt=_sys_prompt_after,
+                tools=_tools_after,
+            )
             return (
                 f"Context compressed: {original_count} -> {new_count} messages\n"
                 f"~{approx_tokens:,} -> ~{new_tokens:,} tokens"

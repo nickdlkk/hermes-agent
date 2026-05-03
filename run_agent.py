@@ -8603,9 +8603,13 @@ class AIAgent:
             # message. Without it, replaying the persisted message causes
             # HTTP 400 ("The reasoning_content in the thinking mode must
             # be passed back to the API"). Include streamed reasoning
-            # text when captured; otherwise pad with empty string.
-            # Refs #15250, #17400.
-            msg["reasoning_content"] = reasoning_text or ""
+            # text when captured; otherwise pad with a single space —
+            # DeepSeek V4 Pro tightened validation and rejects empty
+            # string ("The reasoning content in the thinking mode must
+            # be passed back to the API"). A space satisfies non-empty
+            # checks everywhere without leaking fabricated reasoning.
+            # Refs #15250, #17400, #17341.
+            msg["reasoning_content"] = reasoning_text or " "
 
         # Additive fallback (refs #16844, #16884). Streaming-only providers
         # (glm, MiniMax, gpt-5.x via aigw, Anthropic via openai-compat shims)
@@ -8760,11 +8764,20 @@ class AIAgent:
             return
 
         # 1. Explicit reasoning_content already set — preserve it verbatim
-        # (includes DeepSeek/Kimi's own empty-string placeholder written at
-        # creation time, and any valid reasoning content from the same provider).
+        # (includes DeepSeek/Kimi's own space-placeholder written at creation
+        # time, and any valid reasoning content from the same provider).
+        #
+        # Exception: sessions persisted BEFORE #17341 have empty-string
+        # placeholders pinned at creation time. DeepSeek V4 Pro rejects
+        # those with HTTP 400. When the active provider enforces the
+        # thinking-mode echo, upgrade "" → " " on replay so stale history
+        # doesn't 400 the user on the next turn.
         existing = source_msg.get("reasoning_content")
         if isinstance(existing, str):
-            api_msg["reasoning_content"] = existing
+            if existing == "" and self._needs_thinking_reasoning_pad():
+                api_msg["reasoning_content"] = " "
+            else:
+                api_msg["reasoning_content"] = existing
             return
 
         needs_thinking_pad = self._needs_thinking_reasoning_pad()
@@ -8776,8 +8789,10 @@ class AIAgent:
         # pins reasoning_content at creation time for tool-call turns, so the
         # shape (reasoning set, reasoning_content absent, tool_calls present)
         # is unreachable from same-provider DeepSeek history after this fix.
-        # Inject "" to satisfy the API without leaking another provider's
-        # chain of thought to DeepSeek/Kimi.
+        # Inject a single space to satisfy the API without leaking another
+        # provider's chain of thought to DeepSeek/Kimi. Space (not "")
+        # because DeepSeek V4 Pro rejects empty-string reasoning_content
+        # in thinking mode (refs #17341).
         normalized_reasoning = source_msg.get("reasoning")
         if (
             needs_thinking_pad
@@ -8785,7 +8800,7 @@ class AIAgent:
             and isinstance(normalized_reasoning, str)
             and normalized_reasoning
         ):
-            api_msg["reasoning_content"] = ""
+            api_msg["reasoning_content"] = " "
             return
 
         # 3. Healthy session: promote 'reasoning' field to 'reasoning_content'
@@ -8798,12 +8813,15 @@ class AIAgent:
             return
 
         # 4. DeepSeek / Kimi thinking mode: all assistant messages need
-        # reasoning_content. Inject "" to satisfy the provider's requirement
-        # when no explicit reasoning content is present. Covers both
-        # tool-call turns (already-poisoned history with no reasoning at all)
-        # and plain text turns.
+        # reasoning_content. Inject a single space to satisfy the provider's
+        # requirement when no explicit reasoning content is present. Covers
+        # both tool-call turns (already-poisoned history with no reasoning
+        # at all) and plain text turns. Space (not "") because DeepSeek V4
+        # Pro tightened validation and rejects empty string with HTTP 400
+        # ("The reasoning content in the thinking mode must be passed back
+        # to the API"). Refs #17341.
         if needs_thinking_pad:
-            api_msg["reasoning_content"] = ""
+            api_msg["reasoning_content"] = " "
             return
 
         # 5. reasoning_content was present but not a string (e.g. None after
@@ -9101,9 +9119,14 @@ class AIAgent:
 
         # Update token estimate after compaction so pressure calculations
         # use the post-compression count, not the stale pre-compression one.
-        _compressed_est = (
-            estimate_tokens_rough(new_system_prompt)
-            + estimate_messages_tokens_rough(compressed)
+        # Use estimate_request_tokens_rough() so tool schemas are included —
+        # with 50+ tools enabled, schemas alone can add 20-30K tokens, and
+        # omitting them delays the next compression cycle far past the
+        # configured threshold (issue #14695).
+        _compressed_est = estimate_request_tokens_rough(
+            compressed,
+            system_prompt=new_system_prompt or "",
+            tools=self.tools or None,
         )
         self.context_compressor.last_prompt_tokens = _compressed_est
         self.context_compressor.last_completion_tokens = 0
@@ -13223,7 +13246,13 @@ class AIAgent:
                         # causing premature compression.  (#12026)
                         _real_tokens = _compressor.last_prompt_tokens
                     else:
-                        _real_tokens = estimate_messages_tokens_rough(messages)
+                        # Include tool schemas — with 50+ tools enabled
+                        # these add 20-30K tokens the messages-only
+                        # estimate misses, which can skip compression
+                        # past the configured threshold (#14695).
+                        _real_tokens = estimate_request_tokens_rough(
+                            messages, tools=self.tools or None
+                        )
 
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
                         self._safe_print("  ⟳ compacting context…")

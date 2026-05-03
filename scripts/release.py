@@ -41,6 +41,7 @@ PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 AUTHOR_MAP = {
     # teknium (multiple emails)
     "teknium1@gmail.com": "teknium1",
+    "m@mobrienv.dev": "mikeyobrien",
     "qiyin.zuo@pcitc.com": "qiyin-code",
     "leone.parise@gmail.com": "leoneparise",
     "teknium@nousresearch.com": "teknium1",
@@ -50,6 +51,7 @@ AUTHOR_MAP = {
     "rylen.anil@gmail.com": "rylena",
     "godnanijatin@gmail.com": "jatingodnani",
     "14046872+tmimmanuel@users.noreply.github.com": "tmimmanuel",
+    "657290301@qq.com": "IMHaoyan",
     "revar@users.noreply.github.com": "revaraver",
     # Matrix parity salvage batch (April 2026)
     "sr@samirusani": "samrusani",
@@ -104,6 +106,8 @@ AUTHOR_MAP = {
     "web3blind@users.noreply.github.com": "web3blind",
     "julia@alexland.us": "alexg0bot",
     "christian@scheid.tech": "scheidti",
+    # Moonshot schema anyOf+enum salvage (May 2026)
+    "git@local.invalid": "hendrixfreire",
     "1060770+benjaminsehl@users.noreply.github.com": "benjaminsehl",
     "nerijusn76@gmail.com": "Nerijusas",
     "itonov@proton.me": "Ito-69",
@@ -502,6 +506,7 @@ AUTHOR_MAP = {
     "hubin_ll@qq.com": "LLQWQ",
     "memosr_email@gmail.com": "memosr",
     "jperlow@gmail.com": "perlowja",
+    "jasonpette1783@gmail.com": "web-dev0521",
     "tangyuanjc@JCdeAIfenshendeMac-mini.local": "tangyuanjc",
     "harryplusplus@gmail.com": "harryplusplus",
     "anthhub@163.com": "anthhub",
