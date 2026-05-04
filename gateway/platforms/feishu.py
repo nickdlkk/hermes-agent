@@ -64,7 +64,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -99,6 +99,8 @@ try:
         P2ImMessageMessageReadV1,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
         UpdateMessageRequest,
         UpdateMessageRequestBody,
     )
@@ -138,6 +140,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
+    ProcessingOutcome,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -150,7 +153,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _MARKDOWN_HINT_RE = re.compile(
-    r"(^#{1,6}\s)|(^\s*[-*]\s)|(^\s*\d+\.\s)|(^\s*---+\s*$)|(```)|(`[^`\n]+`)|(\*\*[^*\n].+?\*\*)|(~~[^~\n].+?~~)|(<u>.+?</u>)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)]+\))|(^>\s)",
+    r"(^#{1,6}\s)|(^\s*[-*]\s)|(^\s*\d+\.\s)|(^\s*---+\s*$)|(```)|(`[^`\n]+`)|(\*\*[^*\n].+?\*\*)|(~~[^~\n].+?~~)|(<u>.+?</u>)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)]+\))|(^>\s)|(^\s*\|.+?\|)",
     re.MULTILINE,
 )
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
@@ -159,9 +162,10 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
-# ---------------------------------------------------------------------------
+_INTERACTIVE_CONTENT_INVALID_RE = re.compile(r"content format of the interactive type is incorrect", re.IGNORECASE)
+# -------------------------------------------------------------------------------
 # Media type sets and upload constants
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _AUDIO_EXTENSIONS = {".ogg", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus", ".webm"}
@@ -225,8 +229,9 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
 }
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
+_FEISHU_DONE_EMOJI = "DONE"
 
-# Feishu reactions render as prominent badges, unlike Discord/Telegram's
+_FEISHU_BOT_MSG_TRACK_SIZE = 512
 # small footer emoji — a success badge on every message would add noise, so
 # we only mark start (Typing) and failure (CrossMark); the reply itself is
 # the success signal.
@@ -236,6 +241,8 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # drain on completion; the cap is a safeguard against unbounded growth from
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
+_FEUISHU_RENDER_STATE_TTL_SECONDS = 6 * 60 * 60
+_FEUISHU_RENDER_STATE_MAX_SIZE = 1000
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -538,6 +545,72 @@ def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
     return default if parsed is None else parsed
 
 
+def _split_markdown_table_row(line: str) -> Optional[List[str]]:
+    stripped = line.strip()
+    if "|" not in stripped:
+        return None
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    cells = [cell.strip() for cell in stripped.split("|")]
+    if len(cells) < 2:
+        return None
+    return cells
+
+
+def _is_markdown_table_separator(cells: List[str]) -> bool:
+    if not cells:
+        return False
+    for cell in cells:
+        marker = cell.replace(":", "").replace(" ", "")
+        if not marker or set(marker) != {"-"}:
+            return False
+    return True
+
+
+def _parse_first_markdown_table(content: str) -> Optional[Dict[str, Any]]:
+    lines = content.splitlines()
+    for idx, line in enumerate(lines):
+        headers = _split_markdown_table_row(line)
+        if not headers or idx + 1 >= len(lines):
+            continue
+        divider = _split_markdown_table_row(lines[idx + 1])
+        if not divider or len(divider) != len(headers) or not _is_markdown_table_separator(divider):
+            continue
+        rows: List[List[str]] = []
+        cursor = idx + 2
+        while cursor < len(lines):
+            candidate = _split_markdown_table_row(lines[cursor])
+            if not candidate or len(candidate) != len(headers):
+                break
+            rows.append(candidate)
+            cursor += 1
+        return {
+            "intro": "\n".join(lines[:idx]).strip(),
+            "headers": headers,
+            "rows": rows,
+            "outro": "\n".join(lines[cursor:]).strip(),
+        }
+    return None
+
+
+def _parse_require_mention(configured: Any) -> bool:
+    """Parse require_mention config value, defaulting to True.
+
+    Explicit-false values (false, 0, no, off) return False.
+    All other values, including None, return True.
+    """
+    if configured is not None:
+        if isinstance(configured, str):
+            return configured.lower() not in ("false", "0", "no", "off")
+        return bool(configured)
+    env_value = os.getenv("FEISHU_REQUIRE_MENTION", "")
+    if env_value:
+        return env_value.lower() not in ("false", "0", "no", "off")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Post payload builders and parsers
 # ---------------------------------------------------------------------------
@@ -619,7 +692,7 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
         return None
     sep_idx = None
     for i, ln in enumerate(lines):
-        if re.match(r"^\s*\|[\s\-\:\|]+\|\s*$", ln):
+        if re.match(r"^\s*\|[\s\-\:\|\:]+\|\s*$", ln):
             sep_idx = i
             break
     if sep_idx is None or sep_idx == 0:
@@ -633,45 +706,58 @@ def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
             stripped = stripped[:-1]
         return [c.strip() for c in stripped.split("|")]
 
-    headers = split_row(lines[0])
+    def clean_text(text: str) -> str:
+        """Strip markdown bold/italic markers, backticks, and map[content:...] artifacts."""
+        # Strip markdown bold/italic
+        text = re.sub(r"[*_]{1,2}(.+?)[*_]{1,2}", r"\1", text)
+        # Strip backticks (inline code)
+        text = text.replace("`", "")
+        # Strip map[content:...tag:lark_md] artifacts that LLM may emit as literal cell text
+        # Pattern: map[content:<anything> tag:lark_md] → extract <anything>
+        # Use regex to handle any characters (including extra spaces, nested brackets) between "map[content:" and " tag:lark_md]"
+        # The LLM sometimes emits: map[content:`path` tag:lark_md] or map[content: path  tag:lark_md]
+        text = re.sub(r"map\[content:\s*(.*?)\s*tag:lark_md\]", r"\1", text)
+        return text
+
+    headers = [clean_text(h) for h in split_row(lines[0])]
     if not headers:
         return None
     col_keys = [f"col{i}" for i in range(len(headers))]
-
-    def make_cell(text: str) -> Dict[str, Any]:
-        """Wrap cell text in lark_md object format required by Feishu card table."""
-        # Strip markdown bold/italic markers for plain display
-        clean = re.sub(r"[*_]{1,2}(.+?)[*_]{1,2}", r"\1", text)
-        return {"tag": "lark_md", "content": clean}
 
     columns = [
         {
             "name": col_keys[i],
             "display_name": headers[i],
+            "data_type": "text",
             "width": "auto",
         }
         for i in range(len(headers))
     ]
+
     rows = []
     for line in lines[sep_idx + 1:]:
         cells = split_row(line)
         row: Dict[str, Any] = {}
         for i, key in enumerate(col_keys):
-            cell_text = cells[i] if i < len(cells) else ""
-            row[key] = make_cell(cell_text)
+            cell_text = clean_text(cells[i]) if i < len(cells) else ""
+            row[key] = cell_text or " "
         rows.append(row)
+
     if not rows:
         return None
+
     return {
         "tag": "table",
-        "page_size": min(max(len(rows), 10), 50),
-        "row_size": len(rows),
-        "column_size": len(headers),
-        "header_row": {
-            "cells": [make_cell(h) for h in headers]
-        },
         "columns": columns,
         "rows": rows,
+        "header_style": {
+            "bold": True,
+            "text_align": "left",
+            "text_size": "normal",
+            "background_style": "none",
+            "text_color": "default",
+            "lines": 1,
+        },
     }
 
 
@@ -760,6 +846,8 @@ def _build_interactive_payload_chunks(text: str) -> List[str]:
 def _has_table(content: str) -> bool:
     """Check if content contains markdown table."""
     return bool(_TABLE_ROW_RE.search(content))
+
+
 def parse_feishu_post_payload(
     payload: Any,
     *,
@@ -1509,6 +1597,12 @@ class FeishuAdapter(BasePlatformAdapter):
     # is almost certain.
     _SPLIT_THRESHOLD = 4000
 
+    # Disable streaming edit because tables require interactive cards which
+    # cannot be edited from text/post messages. This causes stream_consumer
+    # to wait for message completion before sending, ensuring tables render
+    # correctly as interactive cards with wide_screen_mode.
+    supports_streaming_edit = False
+
     # =========================================================================
     # Lifecycle — init / settings / connect / disconnect
     # =========================================================================
@@ -1544,6 +1638,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._chat_locks: Dict[str, asyncio.Lock] = {}  # chat_id → lock (per-chat serial processing)
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
+        self._last_sent_message_ids: Dict[Tuple[str, Optional[str]], str] = {}  # (chat_id, thread_id) → last message_id (for completion reaction)
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
         self._app_lock_identity: Optional[str] = None
@@ -1560,6 +1655,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        self._render_state_by_message_id: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1844,6 +1940,208 @@ class FeishuAdapter(BasePlatformAdapter):
             self._webhook_site = None
 
     # =========================================================================
+    # Fallback rail — CardKit v2 default replies + render-state tracking
+    # =========================================================================
+
+    def _looks_like_interactive_payload(self, content: str) -> bool:
+        try:
+            payload = json.loads(content)
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        candidate = payload.get("card") if isinstance(payload.get("card"), dict) else payload
+        return isinstance(candidate, dict) and (
+            "elements" in candidate
+            or "header" in candidate
+            or (isinstance(candidate.get("body"), dict) and "elements" in candidate.get("body", {}))
+        )
+
+    def _normalize_interactive_payload(self, content: str) -> str:
+        try:
+            payload = json.loads(content)
+        except Exception:
+            return content
+        if isinstance(payload, dict) and isinstance(payload.get("card"), dict):
+            payload = payload["card"]
+        return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _payload_invalid_for_msg_type(msg_type: str, message: str) -> bool:
+        # Any "content format … is incorrect" means the payload shape was
+        # rejected by the Feishu API — the fallback sequence should continue.
+        if msg_type == "interactive":
+            return bool(_INTERACTIVE_CONTENT_INVALID_RE.search(message or "")
+                        or _POST_CONTENT_INVALID_RE.search(message or ""))
+        if msg_type == "post":
+            return bool(_POST_CONTENT_INVALID_RE.search(message or ""))
+        return bool(re.search(r"content format.*is incorrect", message or "", re.IGNORECASE))
+
+    @staticmethod
+    def _build_interactive_card_payload(
+        *, title: str = "", template: str = "blue", elements: List[Dict[str, Any]]
+    ) -> str:
+        card = {
+            "schema": "2.0",
+            "config": {"update_multi": True, "width_mode": "fill"},
+            "body": {"elements": elements or [{"tag": "markdown", "content": " "}]},
+        }
+        if title:
+            card["header"] = {"title": {"content": title, "tag": "plain_text"}, "template": template}
+        return json.dumps(card, ensure_ascii=False)
+
+    def _build_default_reply_card_payload(
+        self, content: str, *, title: str = "", template: str = "blue"
+    ) -> str:
+        body = content.strip() or " "
+        return self._build_interactive_card_payload(
+            title=title,
+            template=template,
+            elements=[{"tag": "markdown", "content": body}],
+        )
+
+    def _build_tool_progress_post_body(
+        self, content: str, *, page_no: Optional[int] = None
+    ) -> str:
+        title = "Hermes · 工具执行中"
+        if page_no and page_no > 1:
+            title += f"（{page_no}）"
+        body = content.strip() or "_等待工具输出_"
+        return f"**{title}**\n{body}"
+
+    def _build_table_card_payload(
+        self, content: str, *, title: str = "", template: str = "blue"
+    ) -> str:
+        """Build a CardKit v2 table card using local _build_card_elements (which calls _parse_md_table → clean_text)."""
+        elements = _build_card_elements(content)
+        if not elements:
+            return self._build_default_reply_card_payload(content, title=title, template=template)
+        return self._build_interactive_card_payload(title=title, template=template, elements=elements)
+
+    def _prune_render_states(self) -> None:
+        now = time.time()
+        stale_ids = [
+            message_id
+            for message_id, state in self._render_state_by_message_id.items()
+            if now - float(state.get("updated_at", now)) > _FEUISHU_RENDER_STATE_TTL_SECONDS
+        ]
+        for message_id in stale_ids:
+            self._render_state_by_message_id.pop(message_id, None)
+        while len(self._render_state_by_message_id) > _FEUISHU_RENDER_STATE_MAX_SIZE:
+            self._render_state_by_message_id.popitem(last=False)
+
+    def _remember_render_state(
+        self, message_id: Optional[str], *, kind: str, page_no: Optional[int] = None
+    ) -> None:
+        if not message_id or not kind:
+            return
+        self._prune_render_states()
+        self._render_state_by_message_id[message_id] = {
+            "kind": kind,
+            "page_no": page_no,
+            "updated_at": time.time(),
+        }
+        self._render_state_by_message_id.move_to_end(message_id)
+        self._prune_render_states()
+
+    def _get_render_state(self, message_id: str) -> Optional[Dict[str, Any]]:
+        self._prune_render_states()
+        state = self._render_state_by_message_id.get(message_id)
+        if not state:
+            return None
+        state["updated_at"] = time.time()
+        self._render_state_by_message_id.move_to_end(message_id)
+        return dict(state)
+
+    @staticmethod
+    def _footer_text(_response_meta: Dict[str, Any]) -> str:
+        """Build the model/usage footer string from response metadata."""
+        return (
+            f"Model: {_response_meta['model']} · "
+            f"API calls: {_response_meta['api_calls']} · "
+            f"Context: {_response_meta['context_tokens']:,} / {_response_meta['context_limit']:,} "
+            f"({_response_meta['context_pct']}%) · "
+            f"Compressions: {_response_meta['compressions']}"
+        )
+
+    def _append_card_footer(
+        self, payload: str, _response_meta: Optional[Dict[str, Any]]
+    ) -> str:
+        """Append model/usage footer to a CardKit v2 interactive card payload."""
+        if not _response_meta:
+            return payload
+        card = json.loads(payload)
+        card.setdefault("body", {}).setdefault("elements", []).extend([
+            {"tag": "hr"},
+            {"tag": "markdown", "content": self._footer_text(_response_meta)},
+        ])
+        return json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def _append_post_footer(payload: str, _response_meta: Dict[str, Any]) -> str:
+        """Append model/usage footer to a post (rich text) payload."""
+        footer = FeishuAdapter._footer_text(_response_meta)
+        p = json.loads(payload)
+        p.get("zh_cn", p.get("en_us", {})).setdefault("content", []).append(
+            {"tag": "paragraph", "elements": [{"tag": "plain_text", "content": footer}]}
+        )
+        return json.dumps(p, ensure_ascii=False)
+
+    @staticmethod
+    def _append_text_footer(payload: str, _response_meta: Dict[str, Any]) -> str:
+        """Append model/usage footer to a plain text payload."""
+        footer = FeishuAdapter._footer_text(_response_meta)
+        p = json.loads(payload)
+        p["text"] = (p.get("text") or "") + "\n\n" + footer
+        return json.dumps(p, ensure_ascii=False)
+
+    def _build_fallback_outbound_sequence(
+        self,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        render_state: Optional[Dict[str, Any]] = None,
+    ) -> List[tuple[str, str, Optional[Dict[str, Any]]]]:
+        if self._looks_like_interactive_payload(content):
+            return [("interactive", self._normalize_interactive_payload(content), None)]
+
+        message_kind = str((metadata or {}).get("message_kind") or "").strip().lower()
+        state_kind = str((render_state or {}).get("kind") or "").strip().lower()
+        if message_kind == "tool_progress" or state_kind == "tool_progress":
+            page_no = _coerce_int((metadata or {}).get("progress_page_no"), default=None, min_value=1)
+            if page_no is None:
+                page_no = _coerce_int((render_state or {}).get("page_no"), default=None, min_value=1)
+            progress_content = self._build_tool_progress_post_body(content, page_no=page_no)
+            text_payload = json.dumps(
+                {"text": _strip_markdown_to_plain_text(progress_content)}, ensure_ascii=False
+            )
+            return [
+                ("post", self._build_post_payload(progress_content), {"kind": "tool_progress", "page_no": page_no}),
+                ("text", text_payload, None),
+            ]
+
+        # Table content: use local _build_card_elements (calls _parse_md_table → clean_text)
+        if _has_table(content):
+            primary = (
+                "interactive",
+                self._build_table_card_payload(content),
+                {"kind": "table_reply"},
+            )
+        else:
+            primary = (
+                "interactive",
+                self._build_default_reply_card_payload(content),
+                {"kind": "default_reply"},
+            )
+
+        text_payload = json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False)
+        return [
+            primary,
+            ("post", self._build_post_payload(content), None),
+            ("text", text_payload, None),
+        ]
+
+    # =========================================================================
     # Outbound — send / edit / send_image / send_voice / …
     # =========================================================================
 
@@ -1859,7 +2157,6 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
         _response_meta = (metadata or {}).get("_hermes_response_meta") if metadata else None
         logger.info("[Feishu] send() _response_meta=%s, has_table=%s, content_len=%d", _response_meta is not None, _has_table(formatted), len(content))
@@ -1895,73 +2192,90 @@ class FeishuAdapter(BasePlatformAdapter):
                         if msg_type != "interactive" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
                             raise
                         logger.warning("[Feishu] Invalid interactive payload rejected by API; falling back to post")
+                        _post_payload = _build_markdown_post_payload(_strip_markdown_to_plain_text(formatted))
+                        if _response_meta:
+                            _post_payload = self._append_post_footer(_post_payload, _response_meta)
                         response = await self._feishu_send_with_retry(
                             chat_id=chat_id,
                             msg_type="post",
-                            payload=_build_markdown_post_payload(_strip_markdown_to_plain_text(formatted)),
+                            payload=_post_payload,
                             reply_to=reply_to,
                             metadata=metadata,
                         )
                     last_response = response
             else:
-                # Normal content without tables
+                # Non-table content: use fallback sequence (PR #16280 architecture)
                 chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
                 for chunk in chunks:
-                    msg_type, payload = self._build_outbound_payload(chunk)
-                    # Append text footer to post/text payload before sending
-                    if _response_meta:
-                        _footer_text = f"Model: {_response_meta['model']} · API calls: {_response_meta['api_calls']} · Context: {_response_meta['context_tokens']:,} / {_response_meta['context_limit']:,} ({_response_meta['context_pct']}%) · Compressions: {_response_meta['compressions']}"
-                        if msg_type == "text":
-                            _p = json.loads(payload)
-                            _p["text"] = (_p.get("text") or "") + "\n\n" + _footer_text
-                            payload = json.dumps(_p, ensure_ascii=False)
-                        elif msg_type == "post":
-                            _p = json.loads(payload)
-                            _p.get("zh_cn", {}).get("content", []).append(
-                                {"tag": "paragraph", "elements": [{"tag": "plain_text", "content": _footer_text}]}
-                            )
-                            payload = json.dumps(_p, ensure_ascii=False)
-                    try:
-                        response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
-                            msg_type=msg_type,
-                            payload=payload,
-                            reply_to=reply_to,
-                            metadata=metadata,
-                        )
-                    except Exception as exc:
-                        if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
-                            raise
-                        logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
-                        _fallback_text = _strip_markdown_to_plain_text(chunk)
-                        if _response_meta:
-                            _fallback_text += f"\n\n{_footer_text}"
-                        response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
-                            msg_type="text",
-                            payload=json.dumps({"text": _fallback_text}, ensure_ascii=False),
-                            reply_to=reply_to,
-                            metadata=metadata,
-                        )
-                    if (
-                        msg_type == "post"
-                        and not self._response_succeeded(response)
-                        and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
+                    response = None
+                    chosen_state: Optional[Dict[str, Any]] = None
+                    for msg_type, payload, render_state in self._build_fallback_outbound_sequence(
+                        chunk,
+                        metadata=metadata,
                     ):
-                        logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
-                        _fallback_text = _strip_markdown_to_plain_text(chunk)
+                        logger.info("[Feishu] fallback trial msg_type=%s content_len=%d render_state=%s", msg_type, len(payload), render_state)
+                        # Append footer before sending
                         if _response_meta:
-                            _fallback_text += f"\n\n{_footer_text}"
-                        response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
-                            msg_type="text",
-                            payload=json.dumps({"text": _fallback_text}, ensure_ascii=False),
-                            reply_to=reply_to,
-                            metadata=metadata,
+                            if msg_type == "interactive":
+                                payload = self._append_card_footer(payload, _response_meta)
+                            elif msg_type == "post":
+                                payload = self._append_post_footer(payload, _response_meta)
+                            elif msg_type == "text":
+                                payload = self._append_text_footer(payload, _response_meta)
+                        try:
+                            response = await self._feishu_send_with_retry(
+                                chat_id=chat_id,
+                                msg_type=msg_type,
+                                payload=payload,
+                                reply_to=reply_to,
+                                metadata=metadata,
+                            )
+                        except Exception as exc:
+                            logger.warning("[Feishu] send exception msg_type=%s exc=%s", msg_type, exc)
+                            if self._payload_invalid_for_msg_type(msg_type, str(exc)):
+                                logger.warning("[Feishu] Invalid %s payload rejected by API; falling back", msg_type)
+                                response = None
+                                continue
+                            raise
+
+                        logger.info("[Feishu] send response success=%s msg=%s", self._response_succeeded(response), getattr(response, "msg", None))
+                        if self._response_succeeded(response):
+                            chosen_state = render_state
+                            break
+                        if self._payload_invalid_for_msg_type(
+                            msg_type, str(getattr(response, "msg", "") or "")
+                        ):
+                            logger.warning("[Feishu] %s payload rejected by API response; falling back", msg_type)
+                            response = None
+                            continue
+                        break
+
+                    if response is None:
+                        return SendResult(
+                            success=False, error="Feishu send failed after exhausting fallback sequence"
+                        )
+
+                    logger.info("[Feishu] send chose msg_type=%s render_state=%s message_id=%s",
+                        msg_type,
+                        render_state,
+                        self._extract_response_field(response, "message_id") if response else None)
+
+                    if render_state:
+                        self._remember_render_state(
+                            self._extract_response_field(response, "message_id"),
+                            kind=str(render_state.get("kind") or ""),
+                            page_no=_coerce_int(render_state.get("page_no"), default=None, min_value=1),
                         )
                     last_response = response
 
-            return self._finalize_send_result(last_response, "send failed")
+            result = self._finalize_send_result(last_response, "send failed")
+            # Track last sent message_id for completion reaction.
+            # Use composite key (chat_id, thread_id) so topic messages are
+            # keyed consistently with how on_processing_complete looks them up.
+            if result.success and result.message_id:
+                key = (chat_id, (metadata or {}).get("thread_id"))
+                self._last_sent_message_ids[key] = result.message_id
+            return result
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
@@ -1974,29 +2288,70 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+        """Edit a previously sent Feishu text/post message with render-state tracking."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
         try:
-            msg_type, payload = self._build_outbound_payload(content)
-            body = self._build_update_message_body(msg_type=msg_type, content=payload)
-            request = self._build_update_message_request(message_id=message_id, request_body=body)
-            response = await asyncio.to_thread(self._client.im.v1.message.update, request)
-            result = self._finalize_send_result(response, "update failed")
-            if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
-                logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
-                fallback_body = self._build_update_message_body(
-                    msg_type="text",
-                    content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
-                )
-                fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
-                result = self._finalize_send_result(fallback_response, "update failed")
-            if result.success:
-                result.message_id = message_id
-            return result
+            render_state = self._get_render_state(message_id)
+            logger.info("[Feishu] edit_message message_id=%s render_state=%s", message_id, render_state)
+            if not render_state:
+                # No render state: use existing approach
+                msg_type, payload = self._build_outbound_payload(content)
+                body = self._build_update_message_body(msg_type=msg_type, content=payload)
+                request = self._build_update_message_request(message_id=message_id, request_body=body)
+                response = await asyncio.to_thread(self._client.im.v1.message.update, request)
+                result = self._finalize_send_result(response, "update failed")
+                if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
+                    logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
+                    fallback_body = self._build_update_message_body(
+                        msg_type="text",
+                        content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
+                    )
+                    fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
+                    fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
+                    result = self._finalize_send_result(fallback_response, "update failed")
+                if result.success:
+                    result.message_id = message_id
+                return result
+
+            # Has render state: use fallback sequence to continue the right chain
+            final_result: Optional[SendResult] = None
+            for msg_type, payload, next_state in self._build_fallback_outbound_sequence(
+                content,
+                render_state=render_state,
+            ):
+                logger.info("[Feishu] edit_message fallback trial msg_type=%s next_state=%s", msg_type, next_state)
+                if msg_type == "interactive":
+                    # Use PATCH /im/v1/messages/:message_id for interactive card updates
+                    request = self._build_patch_message_request(message_id=message_id, content=payload)
+                    response = await asyncio.to_thread(self._client.im.v1.message.patch, request)
+                else:
+                    body = self._build_update_message_body(msg_type=msg_type, content=payload)
+                    request = self._build_update_message_request(message_id=message_id, request_body=body)
+                    response = await asyncio.to_thread(self._client.im.v1.message.update, request)
+                result = self._finalize_send_result(response, "update failed")
+                logger.info("[Feishu] edit_message result.success=%s error=%s", result.success, result.error)
+                if result.success:
+                    final_result = result
+                    if next_state:
+                        self._remember_render_state(
+                            message_id,
+                            kind=str(next_state.get("kind") or ""),
+                            page_no=_coerce_int(next_state.get("page_no"), default=None, min_value=1),
+                        )
+                    break
+                if self._payload_invalid_for_msg_type(msg_type, result.error or ""):
+                    logger.warning("[Feishu] Invalid %s update payload rejected; falling back", msg_type)
+                    continue
+                final_result = result
+                break
+
+            if final_result:
+                final_result.message_id = message_id
+                return final_result
+            return SendResult(success=False, error="edit_message failed after exhausting fallback")
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
@@ -2184,9 +2539,14 @@ class FeishuAdapter(BasePlatformAdapter):
                     override_error="Feishu image upload missing image_key",
                 )
 
-            if caption:
+            _thread_id = (metadata or {}).get("thread_id")
+            # When thread_id is present but reply_to is not, Feishu's native
+            # image message type does not support receive_id=thread_id — fall
+            # back to a post payload that wraps the image_key.
+            _use_post = bool(_thread_id and not reply_to)
+            if caption or _use_post:
                 post_payload = self._build_media_post_payload(
-                    caption=caption,
+                    caption=caption or "",
                     media_tag={"tag": "img", "image_key": image_key},
                 )
                 message_response = await self._feishu_send_with_retry(
@@ -2315,6 +2675,10 @@ class FeishuAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         """Feishu text messages are plain text by default."""
         return content.strip()
+
+    # Note: truncate_message is not overridden here because table content is
+    # handled separately in send() via _build_outbound_payload_chunks.  For
+    # non-table content, the base class truncate_message works correctly.
 
     # =========================================================================
     # Inbound event handlers
@@ -2768,6 +3132,44 @@ class FeishuAdapter(BasePlatformAdapter):
         logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
         await self._handle_message_with_guards(synthetic_event)
 
+    async def _add_done_reaction(self, message_id: str) -> Optional[str]:
+        """Add a DONE emoji reaction to signal the message processing is complete."""
+        if not self._client or not message_id:
+            return None
+        try:
+            from lark_oapi.api.im.v1 import (  # lazy import — keeps optional dep optional
+                CreateMessageReactionRequest,
+                CreateMessageReactionRequestBody,
+            )
+            body = (
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type({"emoji_type": _FEISHU_DONE_EMOJI})
+                .build()
+            )
+            request = (
+                CreateMessageReactionRequest.builder()
+                .message_id(message_id)
+                .request_body(body)
+                .build()
+            )
+            response = await asyncio.to_thread(self._client.im.v1.message_reaction.create, request)
+            if response and getattr(response, "success", lambda: False)():
+                data = getattr(response, "data", None)
+                return getattr(data, "reaction_id", None)
+            logger.debug(
+                "[Feishu] Failed to add done reaction to %s: code=%s msg=%s",
+                message_id,
+                getattr(response, "code", None),
+                getattr(response, "msg", None),
+            )
+        except Exception:
+            logger.debug("[Feishu] Failed to add done reaction to %s", message_id, exc_info=True)
+        return None
+
+    # =========================================================================
+    # Processing lifecycle hooks
+    # =========================================================================
+
     # =========================================================================
     # Per-chat serialization and typing indicator
     # =========================================================================
@@ -2909,6 +3311,16 @@ class FeishuAdapter(BasePlatformAdapter):
 
         if outcome is ProcessingOutcome.FAILURE:
             await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
+        elif outcome is ProcessingOutcome.SUCCESS:
+            # Add DONE reaction to the bot's last sent message in this chat.
+            # Use composite key (chat_id, thread_id) matching how send() stores it.
+            chat_id = getattr(event.source, "chat_id", "") if event.source else ""
+            thread_id = getattr(event.source, "thread_id", None)
+            key = (chat_id, thread_id)
+            last_message_id = self._last_sent_message_ids.get(key)
+            if last_message_id:
+                await self._add_done_reaction(last_message_id)
+                self._last_sent_message_ids.pop(key, None)
 
     # =========================================================================
     # Webhook server and security
@@ -2975,11 +3387,9 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)
-            or getattr(message, "root_id", None)
             or None
         )
         reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
@@ -3011,7 +3421,7 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
-            thread_id=thread_id,
+            thread_id=getattr(message, "thread_id", None) or None,
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
         )
@@ -3142,18 +3552,13 @@ class FeishuAdapter(BasePlatformAdapter):
                 },
             )
             response.raise_for_status()
-            # Snapshot Content-Type and body while the client context is
-            # still active so pooled connections fully release on exit.
-            # See #18451.
-            content_type_hdr = str(response.headers.get("Content-Type", ""))
-            body = response.content
         filename = self._derive_remote_filename(
             file_url,
-            content_type=content_type_hdr,
+            content_type=str(response.headers.get("Content-Type", "")),
             default_name=preferred_name,
             default_ext=default_ext,
         )
-        cached_path = cache_document_from_bytes(body, filename)
+        cached_path = cache_document_from_bytes(response.content, filename)
         return cached_path, filename
 
     @staticmethod
@@ -3581,7 +3986,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return cached_path, media_type
         except Exception:
             logger.warning("[Feishu] Failed to cache image resource %s", image_key, exc_info=True)
-            return "", ""
+            return None, None
 
     async def _download_feishu_message_resource(
         self,
@@ -3970,7 +4375,11 @@ class FeishuAdapter(BasePlatformAdapter):
         ):
             return "group_policy_rejected"
         if require_mention and not self._mentions_self(message):
-            return "group_policy_rejected"
+            # Topic-thread messages bypass mention requirement — the user explicitly
+            # chose to interact inside a topic, so @mention is redundant friction.
+            thread_id = getattr(message, "thread_id", None) or None
+            if not thread_id:
+                return "group_policy_rejected"
         return None
 
     def _require_mention_for(self, chat_id: str) -> bool:
@@ -4299,7 +4708,11 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
+        thread_id = (metadata or {}).get("thread_id")
+        reply_in_thread = bool(thread_id)
+        # Only use the reply API when we have an actual message_id to reply to.
+        # reply_to is the message ID; thread_id is the topic/thread ID.
+        # These are different — we cannot use thread_id as a message_id.
         if reply_to:
             body = self._build_reply_message_body(
                 content=payload,
@@ -4307,16 +4720,28 @@ class FeishuAdapter(BasePlatformAdapter):
                 reply_in_thread=reply_in_thread,
                 uuid_value=str(uuid.uuid4()),
             )
-            request = self._build_reply_message_request(reply_to, body)
+            request = self._build_reply_message_request(reply_to, body, thread_id=thread_id)
             return await asyncio.to_thread(self._client.im.v1.message.reply, request)
 
-        body = self._build_create_message_body(
-            receive_id=chat_id,
-            msg_type=msg_type,
-            content=payload,
-            uuid_value=str(uuid.uuid4()),
-        )
-        request = self._build_create_message_request("chat_id", body)
+        # No reply_to: use the create API. If thread_id is present, use it as
+        # receive_id so the message is created inside the correct topic thread.
+        _thread_id = (metadata or {}).get("thread_id")
+        if _thread_id:
+            body = self._build_create_message_body(
+                receive_id=_thread_id,
+                msg_type=msg_type,
+                content=payload,
+                uuid_value=str(uuid.uuid4()),
+            )
+            request = self._build_create_message_request("thread_id", body)
+        else:
+            body = self._build_create_message_body(
+                receive_id=chat_id,
+                msg_type=msg_type,
+                content=payload,
+                uuid_value=str(uuid.uuid4()),
+            )
+            request = self._build_create_message_request("chat_id", body)
         return await asyncio.to_thread(self._client.im.v1.message.create, request)
 
     @staticmethod
@@ -4458,15 +4883,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 if active_reply_to and not self._response_succeeded(response):
                     code = getattr(response, "code", None)
                     if code in _FEISHU_REPLY_FALLBACK_CODES:
-                        if (metadata or {}).get("thread_id"):
-                            logger.warning(
-                                "[Feishu] Reply to %s failed in thread %s (code %s — message withdrawn/missing); "
-                                "skipping top-level fallback to avoid creating a new topic",
-                                active_reply_to,
-                                (metadata or {}).get("thread_id"),
-                                code,
-                            )
-                            return response
                         logger.warning(
                             "[Feishu] Reply to %s failed (code %s — message withdrawn/missing); "
                             "falling back to new message in chat %s",
@@ -4569,15 +4985,21 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
-    def _build_reply_message_request(message_id: str, request_body: Any) -> Any:
+    def _build_reply_message_request(message_id: str, request_body: Any, thread_id: Optional[str] = None) -> Any:
         if "ReplyMessageRequest" in globals():
-            return (
+            builder = (
                 ReplyMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(request_body)
-                .build()
             )
-        return SimpleNamespace(message_id=message_id, request_body=request_body)
+            req = builder.build()
+            if thread_id:
+                req.add_query("thread_id", thread_id)
+            return req
+        ns = SimpleNamespace(message_id=message_id, request_body=request_body)
+        if thread_id:
+            ns.thread_id = thread_id
+        return ns
 
     @staticmethod
     def _build_update_message_body(*, msg_type: str, content: str) -> Any:
@@ -4602,6 +5024,19 @@ class FeishuAdapter(BasePlatformAdapter):
         return SimpleNamespace(message_id=message_id, request_body=request_body)
 
     @staticmethod
+    def _build_patch_message_request(message_id: str, content: str) -> Any:
+        """Build a PATCH request for updating an interactive card message."""
+        if "PatchMessageRequest" in globals():
+            body = PatchMessageRequestBody.builder().content(content).build()
+            return (
+                PatchMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(body)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=SimpleNamespace(content=content))
+
+    @staticmethod
     def _build_create_message_body(*, receive_id: str, msg_type: str, content: str, uuid_value: str) -> Any:
         if "CreateMessageRequestBody" in globals():
             return (
@@ -4620,15 +5055,21 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
-    def _build_create_message_request(receive_id_type: str, request_body: Any) -> Any:
+    def _build_create_message_request(receive_id_type: str, request_body: Any, topic_id: Optional[str] = None) -> Any:
         if "CreateMessageRequest" in globals():
-            return (
+            req = (
                 CreateMessageRequest.builder()
                 .receive_id_type(receive_id_type)
                 .request_body(request_body)
                 .build()
             )
-        return SimpleNamespace(receive_id_type=receive_id_type, request_body=request_body)
+            if topic_id:
+                req.add_query("topic_id", topic_id)
+            return req
+        ns = SimpleNamespace(receive_id_type=receive_id_type, request_body=request_body)
+        if topic_id:
+            ns.topic_id = topic_id
+        return ns
 
     @staticmethod
     def _build_image_upload_body(*, image_type: str, image: Any) -> Any:
