@@ -604,6 +604,162 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     return rows or [[{"tag": "md", "text": content}]]
 
 
+# ---------------------------------------------------------------------------
+# Markdown table parsing and interactive card building
+# ---------------------------------------------------------------------------
+
+_TABLE_ROW_RE = re.compile(r"^\s*\|", re.MULTILINE)
+_MAX_TABLES_PER_CARD = 5
+
+
+def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
+    """Parse GFM table lines into a Feishu native table component dict."""
+    lines = [ln for ln in table_lines if ln.strip()]
+    if len(lines) < 2:
+        return None
+    sep_idx = None
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*\|[\s\-\:\|]+\|\s*$", ln):
+            sep_idx = i
+            break
+    if sep_idx is None or sep_idx == 0:
+        return None
+
+    def split_row(line: str) -> List[str]:
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            stripped = stripped[1:]
+        if stripped.endswith("|"):
+            stripped = stripped[:-1]
+        return [c.strip() for c in stripped.split("|")]
+
+    headers = split_row(lines[0])
+    if not headers:
+        return None
+    col_keys = [f"col{i}" for i in range(len(headers))]
+
+    def make_cell(text: str) -> Dict[str, Any]:
+        """Wrap cell text in lark_md object format required by Feishu card table."""
+        # Strip markdown bold/italic markers for plain display
+        clean = re.sub(r"[*_]{1,2}(.+?)[*_]{1,2}", r"\1", text)
+        return {"tag": "lark_md", "content": clean}
+
+    columns = [
+        {
+            "name": col_keys[i],
+            "display_name": headers[i],
+            "width": "auto",
+        }
+        for i in range(len(headers))
+    ]
+    rows = []
+    for line in lines[sep_idx + 1:]:
+        cells = split_row(line)
+        row: Dict[str, Any] = {}
+        for i, key in enumerate(col_keys):
+            cell_text = cells[i] if i < len(cells) else ""
+            row[key] = make_cell(cell_text)
+        rows.append(row)
+    if not rows:
+        return None
+    return {
+        "tag": "table",
+        "page_size": min(max(len(rows), 10), 50),
+        "row_size": len(rows),
+        "column_size": len(headers),
+        "header_row": {
+            "cells": [make_cell(h) for h in headers]
+        },
+        "columns": columns,
+        "rows": rows,
+    }
+
+
+def _convert_md_headings_to_bold(text: str) -> str:
+    """Convert Markdown headings (##, ###, etc.) to bold text."""
+    return re.sub(r"^#{1,6}\s+(.+)$", r"**\1**", text, flags=re.MULTILINE)
+
+
+def _build_card_elements(text: str) -> List[Dict[str, Any]]:
+    """Parse text into a list of card elements (table or markdown)."""
+    lines = text.split("\n")
+    elements: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _TABLE_ROW_RE.match(line):
+            table_block: List[str] = []
+            while i < len(lines) and _TABLE_ROW_RE.match(lines[i]):
+                table_block.append(lines[i])
+                i += 1
+            table_elem = _parse_md_table(table_block)
+            if table_elem:
+                elements.append(table_elem)
+            else:
+                fallback = _convert_md_headings_to_bold("\n".join(table_block))
+                elements.append({"tag": "markdown", "content": fallback})
+        else:
+            text_block: List[str] = []
+            while i < len(lines) and not _TABLE_ROW_RE.match(lines[i]):
+                text_block.append(lines[i])
+                i += 1
+            content = "\n".join(text_block).strip()
+            if content:
+                content = _convert_md_headings_to_bold(content)
+                elements.append({"tag": "markdown", "content": content})
+    if not elements:
+        elements = [{"tag": "markdown", "content": _convert_md_headings_to_bold(text)}]
+    return elements
+
+
+def _split_card_elements(elements: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Split elements into chunks, each with at most _MAX_TABLES_PER_CARD tables."""
+    chunks: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    pending: List[Dict[str, Any]] = []
+    table_count = 0
+    for elem in elements:
+        if elem.get("tag") == "table":
+            if table_count >= _MAX_TABLES_PER_CARD:
+                chunks.append(current)
+                current = list(pending)
+                table_count = 0
+            else:
+                current.extend(pending)
+            pending = []
+            current.append(elem)
+            table_count += 1
+        else:
+            pending.append(elem)
+    current.extend(pending)
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _build_interactive_payload(text: str) -> str:
+    """Build an interactive card JSON with wide_screen_mode for table rendering."""
+    elements = _build_card_elements(text)
+    card = {
+        "config": {"wide_screen_mode": True},
+        "elements": elements,
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
+def _build_interactive_payload_chunks(text: str) -> List[str]:
+    """Build card JSONs, split when table count exceeds the limit."""
+    elements = _build_card_elements(text)
+    chunks = _split_card_elements(elements)
+    return [
+        json.dumps({"config": {"wide_screen_mode": True}, "elements": chunk}, ensure_ascii=False)
+        for chunk in chunks
+    ]
+
+
+def _has_table(content: str) -> bool:
+    """Check if content contains markdown table."""
+    return bool(_TABLE_ROW_RE.search(content))
 def parse_feishu_post_payload(
     payload: Any,
     *,
@@ -1705,43 +1861,105 @@ class FeishuAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
+        _response_meta = (metadata or {}).get("_hermes_response_meta") if metadata else None
+        logger.info("[Feishu] send() _response_meta=%s, has_table=%s, content_len=%d", _response_meta is not None, _has_table(formatted), len(content))
 
         try:
-            for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(chunk)
-                try:
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type=msg_type,
-                        payload=payload,
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
-                        raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                if (
-                    msg_type == "post"
-                    and not self._response_succeeded(response)
-                    and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
-                ):
-                    logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                last_response = response
+            # For content with tables, use special chunking that preserves table boundaries
+            if _has_table(formatted):
+                payload_chunks = self._build_outbound_payload_chunks(formatted)
+                for msg_type, payload in payload_chunks:
+                    # Append Card native footer (hr + note) before sending
+                    if _response_meta and msg_type == "interactive":
+                        _card = json.loads(payload)
+                        _card["elements"].extend([
+                            {"tag": "hr"},
+                            {
+                                "tag": "note",
+                                "elements": [{
+                                    "tag": "plain_text",
+                                    "content": f"Model: {_response_meta['model']} · API calls: {_response_meta['api_calls']} · Context: {_response_meta['context_tokens']:,} / {_response_meta['context_limit']:,} ({_response_meta['context_pct']}%) · Compressions: {_response_meta['compressions']}",
+                                }]
+                            },
+                        ])
+                        payload = json.dumps(_card, ensure_ascii=False)
+                    try:
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type=msg_type,
+                            payload=payload,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    except Exception as exc:
+                        if msg_type != "interactive" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                            raise
+                        logger.warning("[Feishu] Invalid interactive payload rejected by API; falling back to post")
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="post",
+                            payload=_build_markdown_post_payload(_strip_markdown_to_plain_text(formatted)),
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    last_response = response
+            else:
+                # Normal content without tables
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+                for chunk in chunks:
+                    msg_type, payload = self._build_outbound_payload(chunk)
+                    # Append text footer to post/text payload before sending
+                    if _response_meta:
+                        _footer_text = f"Model: {_response_meta['model']} · API calls: {_response_meta['api_calls']} · Context: {_response_meta['context_tokens']:,} / {_response_meta['context_limit']:,} ({_response_meta['context_pct']}%) · Compressions: {_response_meta['compressions']}"
+                        if msg_type == "text":
+                            _p = json.loads(payload)
+                            _p["text"] = (_p.get("text") or "") + "\n\n" + _footer_text
+                            payload = json.dumps(_p, ensure_ascii=False)
+                        elif msg_type == "post":
+                            _p = json.loads(payload)
+                            _p.get("zh_cn", {}).get("content", []).append(
+                                {"tag": "paragraph", "elements": [{"tag": "plain_text", "content": _footer_text}]}
+                            )
+                            payload = json.dumps(_p, ensure_ascii=False)
+                    try:
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type=msg_type,
+                            payload=payload,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    except Exception as exc:
+                        if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                            raise
+                        logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                        _fallback_text = _strip_markdown_to_plain_text(chunk)
+                        if _response_meta:
+                            _fallback_text += f"\n\n{_footer_text}"
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="text",
+                            payload=json.dumps({"text": _fallback_text}, ensure_ascii=False),
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    if (
+                        msg_type == "post"
+                        and not self._response_succeeded(response)
+                        and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
+                    ):
+                        logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
+                        _fallback_text = _strip_markdown_to_plain_text(chunk)
+                        if _response_meta:
+                            _fallback_text += f"\n\n{_footer_text}"
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="text",
+                            payload=json.dumps({"text": _fallback_text}, ensure_ascii=False),
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    last_response = response
 
             return self._finalize_send_result(last_response, "send failed")
         except Exception as exc:
@@ -3992,10 +4210,21 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+        if _has_table(content):
+            return "interactive", _build_interactive_payload(content)
         if _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
+
+    def _build_outbound_payload_chunks(self, content: str) -> List[tuple[str, str]]:
+        """Build payload chunks for content with multiple tables."""
+        if _has_table(content):
+            chunks = _build_interactive_payload_chunks(content)
+            return [("interactive", chunk) for chunk in chunks]
+        if _MARKDOWN_HINT_RE.search(content):
+            return [("post", _build_markdown_post_payload(content))]
+        return [("text", json.dumps({"text": content}, ensure_ascii=False))]
 
     async def _send_uploaded_file_message(
         self,

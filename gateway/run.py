@@ -6348,6 +6348,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -12133,6 +12134,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        event = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -12609,6 +12611,7 @@ class GatewayRunner:
             # triggering an UnboundLocalError on the earlier read at
             # `_resolve_turn_agent_config(message, …)`.
             nonlocal message
+            nonlocal event
 
             # session_key is now set via contextvars in _set_session_env()
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
@@ -13197,6 +13200,22 @@ class GatewayRunner:
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+            _api_calls = getattr(_agent, "session_api_calls", 0) if _agent else 0
+            _ctx = _agent.context_compressor if _agent and hasattr(_agent, "context_compressor") else None
+            _ctx_tokens = getattr(_ctx, "last_prompt_tokens", 0) if _ctx else 0
+            _ctx_len = getattr(_ctx, "context_length", 0) if _ctx else 0
+            _ctx_pct = min(100, int(_ctx_tokens / _ctx_len * 100)) if _ctx_len else 0
+            _compressions = getattr(_ctx, "compression_count", 0) if _ctx else 0
+
+            # Attach response metadata for footer rendering (Card: native footer / post+text: appended text)
+            event._hermes_response_meta = {
+                "model": _resolved_model,
+                "api_calls": _api_calls,
+                "context_tokens": _ctx_tokens,
+                "context_limit": _ctx_len,
+                "context_pct": _ctx_pct,
+                "compressions": _compressions,
+            }
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
@@ -13855,6 +13874,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    event=event,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task

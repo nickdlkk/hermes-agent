@@ -2771,6 +2771,163 @@ class TestAdapterBehavior(unittest.TestCase):
             [[{"tag": "md", "text": "---\n1. 第一项\n<u>下划线</u>\n~~删除线~~"}]],
         )
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_uses_interactive_for_markdown_table(self):
+        """Markdown tables should be sent as interactive cards with wide_screen_mode."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_table"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        table_content = "| 名称 | 数量 |\n|---|---|\n| 苹果 | 10 |\n| 香蕉 | 20 |"
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content=table_content,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+        payload = json.loads(captured["request"].request_body.content)
+        # Should have config with wide_screen_mode
+        self.assertIn("config", payload)
+        self.assertTrue(payload["config"].get("wide_screen_mode"))
+        # Should have elements with a table
+        self.assertIn("elements", payload)
+        elements = payload["elements"]
+        self.assertTrue(any(e.get("tag") == "table" for e in elements))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_table_with_alignment(self):
+        """Tables with alignment markers should preserve column alignment."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.platforms.feishu import _parse_md_table
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_table_align"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        # Table with alignment: left, center, right
+        table_content = "| 项目 | 数量 | 价格 |\n|:---|:---:|---:|\n| 苹果 | 10 | $5.00 |"
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content=table_content,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+        payload = json.loads(captured["request"].request_body.content)
+        elements = payload["elements"]
+        table_elem = next(e for e in elements if e.get("tag") == "table")
+        columns = table_elem.get("columns", [])
+        self.assertEqual(len(columns), 3)
+        # horizontal_align is not supported in Feishu Card table columns
+        self.assertIsNone(columns[0].get("horizontal_align"))
+        self.assertIsNone(columns[1].get("horizontal_align"))
+        self.assertIsNone(columns[2].get("horizontal_align"))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_mixed_table_and_text(self):
+        """Content with both table and text should use interactive card."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_mixed"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        mixed_content = "这是水果列表：\n\n| 名称 | 数量 |\n|---|---|\n| 苹果 | 10 |\n\n共 10 个。"
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content=mixed_content,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+        payload = json.loads(captured["request"].request_body.content)
+        elements = payload["elements"]
+        # Should have both markdown and table elements
+        has_markdown = any(e.get("tag") == "markdown" for e in elements)
+        has_table = any(e.get("tag") == "table" for e in elements)
+        self.assertTrue(has_markdown)
+        self.assertTrue(has_table)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_table_heading_convert_to_bold(self):
+        """Markdown headings in table context should be converted to bold."""
+        from gateway.platforms.feishu import _convert_md_headings_to_bold
+
+        result = _convert_md_headings_to_bold("## 标题\n普通文本")
+        self.assertEqual(result, "**标题**\n普通文本")
+
+        result = _convert_md_headings_to_bold("### 小标题\n| 列 | 表 |")
+        self.assertEqual(result, "**小标题**\n| 列 | 表 |")
+
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
 class TestHydrateBotIdentity(unittest.TestCase):
