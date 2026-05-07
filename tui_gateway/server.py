@@ -280,7 +280,7 @@ def _notify_session_boundary(event_type: str, session_id: str | None) -> None:
         pass
 
 
-def _finalize_session(session: dict | None) -> None:
+def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
     """Best-effort finalize hook + memory commit for a session."""
     if not session or session.get("_finalized"):
         return
@@ -299,13 +299,24 @@ def _finalize_session(session: dict | None) -> None:
         except Exception:
             pass
 
-    session_id = getattr(agent, "session_id", None) or session.get("session_key")
+    session_key = session.get("session_key")
+    session_id = getattr(agent, "session_id", None) or session_key
     _notify_session_boundary("on_session_finalize", session_id)
+
+    # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
+    # Adapted from #18283 (luyao618) and #18299 (Bartok9).
+    if session_key:
+        try:
+            db = _get_db()
+            if db is not None:
+                db.end_session(session_key, end_reason)
+        except Exception:
+            pass
 
 
 def _shutdown_sessions() -> None:
     for session in list(_sessions.values()):
-        _finalize_session(session)
+        _finalize_session(session, end_reason="tui_shutdown")
         try:
             worker = session.get("slash_worker")
             if worker:
@@ -539,32 +550,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
             finally:
                 _clear_session_context(tokens)
 
-            db = _get_db()
-            if db is not None:
-                db.create_session(key, source="tui", model=_resolve_model())
-                pending_title = (current.get("pending_title") or "").strip()
-                if pending_title:
-                    try:
-                        title_applied = db.set_session_title(key, pending_title)
-                        if title_applied:
-                            current["pending_title"] = None
-                        else:
-                            existing_row = db.get_session(key)
-                            existing_title = ((existing_row or {}).get("title") or "").strip()
-                            if existing_title == pending_title:
-                                current["pending_title"] = None
-                            else:
-                                logger.info(
-                                    "Pending title still queued for session %s (wanted=%r, current=%r)",
-                                    sid,
-                                    pending_title,
-                                    existing_title,
-                                )
-                    except ValueError as e:
-                        current["pending_title"] = None
-                        logger.info("Dropping pending title for session %s: %s", sid, e)
-                    except Exception:
-                        logger.warning("Failed to apply pending title for session %s", sid, exc_info=True)
+            # Session DB row deferred to first run_conversation() call.
+            # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
 
             try:
@@ -1085,9 +1072,7 @@ def _apply_model_switch(sid: str, session: dict, raw_input: str) -> dict:
         from hermes_cli.config import get_compatible_custom_providers, load_config
 
         cfg = load_config()
-        user_provs = [
-            {"provider": k, **v} for k, v in (cfg.get("providers") or {}).items()
-        ]
+        user_provs = cfg.get("providers")
         custom_provs = get_compatible_custom_providers(cfg)
     except Exception:
         pass
@@ -2455,6 +2440,12 @@ def _(rid, params: dict) -> dict:
     except Exception:
         pass
     try:
+        agent = session.get("agent")
+        if agent and hasattr(agent, "close"):
+            agent.close()
+    except Exception:
+        pass
+    try:
         worker = session.get("slash_worker")
         if worker:
             worker.close()
@@ -2837,6 +2828,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
     def run():
         approval_token = None
         session_tokens = []
+        goal_followup = None  # set by the post-turn goal hook below
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -2996,6 +2988,66 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 payload["rendered"] = rendered
             _emit("message.complete", sid, payload)
 
+            # ── /goal continuation (Ralph-style loop) ─────────────────
+            # After every TUI turn, if a /goal is active, ask the judge
+            # whether the goal is done and — if not and we're still under
+            # budget — queue a continuation prompt to run after this
+            # thread releases session["running"]. The verdict message
+            # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
+            # a system line so the user sees progress regardless of
+            # outcome. Mirrors gateway/run._post_turn_goal_continuation.
+            if (
+                status == "complete"
+                and isinstance(raw, str)
+                and raw.strip()
+            ):
+                try:
+                    from hermes_cli.goals import GoalManager
+
+                    sid_key = session.get("session_key") or ""
+                    if sid_key:
+                        try:
+                            goals_cfg = (_load_cfg().get("goals") or {})
+                            goal_max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+                        except Exception:
+                            goal_max_turns = 20
+                        goal_mgr = GoalManager(
+                            session_id=sid_key,
+                            default_max_turns=goal_max_turns,
+                        )
+                        if goal_mgr.is_active():
+                            decision = goal_mgr.evaluate_after_turn(
+                                raw, user_initiated=True,
+                            )
+                            verdict_msg = decision.get("message") or ""
+                            if verdict_msg:
+                                _emit(
+                                    "status.update",
+                                    sid,
+                                    {"kind": "goal", "text": verdict_msg},
+                                )
+                            if decision.get("should_continue"):
+                                cont_prompt = decision.get("continuation_prompt") or ""
+                                if cont_prompt:
+                                    goal_followup = cont_prompt
+                except Exception as _goal_exc:
+                    print(
+                        f"[tui_gateway] goal continuation hook failed: "
+                        f"{type(_goal_exc).__name__}: {_goal_exc}",
+                        file=sys.stderr,
+                    )
+
+            # Apply pending_title now that the DB row exists.
+            _pending = session.get("pending_title")
+            if _pending and status == "complete":
+                _pdb = _get_db()
+                if _pdb:
+                    try:
+                        if _pdb.set_session_title(session.get("session_key") or sid, _pending):
+                            session["pending_title"] = None
+                    except Exception:
+                        pass  # Best effort — auto-title will handle it below
+
             if (
                 status == "complete"
                 and isinstance(raw, str)
@@ -3064,6 +3116,31 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _clear_session_context(session_tokens)
             with session["history_lock"]:
                 session["running"] = False
+
+        # Chain a goal-continuation turn if the judge said so. We do
+        # this AFTER the finally releases session["running"], so the
+        # nested _run_prompt_submit doesn't deadlock on the busy
+        # guard. A real user prompt that races us wins because
+        # prompt.submit sets running=True under the history_lock and
+        # we check that guard before re-firing.
+        if goal_followup:
+            with session["history_lock"]:
+                if session.get("running"):
+                    # User already sent something — their turn wins,
+                    # the judge will re-run on the next turn anyway.
+                    return
+                session["running"] = True
+            try:
+                _emit("message.start", sid)
+                _run_prompt_submit(rid, sid, session, goal_followup)
+            except Exception as _cont_exc:
+                print(
+                    f"[tui_gateway] goal continuation dispatch failed: "
+                    f"{type(_cont_exc).__name__}: {_cont_exc}",
+                    file=sys.stderr,
+                )
+                with session["history_lock"]:
+                    session["running"] = False
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -3932,6 +4009,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "q",
         "steer",
         "plan",
+        "goal",
     }
 )
 
@@ -4243,6 +4321,77 @@ def _(rid, params: dict) -> dict:
                 pass
         # Fallback: no active run, treat as next-turn message
         return _ok(rid, {"type": "send", "message": arg})
+
+    if name == "goal":
+        if not session:
+            return _err(rid, 4001, "no active session")
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            return _err(rid, 5030, f"goals unavailable: {exc}")
+
+        sid_key = session.get("session_key") or ""
+        if not sid_key:
+            return _err(rid, 4001, "no session key")
+
+        try:
+            goals_cfg = (_load_cfg().get("goals") or {})
+            max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+        except Exception:
+            max_turns = 20
+        mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
+
+        lower = arg.strip().lower()
+        if not arg.strip() or lower == "status":
+            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
+            return _ok(rid, {"type": "exec", "output": out})
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                return _ok(rid, {"type": "exec", "output": "No goal to resume."})
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": (
+                        f"▶ Goal resumed: {state.goal}\n"
+                        "Send any message to continue, or wait — I'll take the next step on the next turn."
+                    ),
+                },
+            )
+        if lower in ("clear", "stop", "done"):
+            had = mgr.has_goal()
+            mgr.clear()
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": "✓ Goal cleared." if had else "No active goal.",
+                },
+            )
+
+        # Otherwise — treat the remaining text as the new goal.
+        try:
+            state = mgr.set(arg)
+        except ValueError as exc:
+            return _err(rid, 4004, f"invalid goal: {exc}")
+
+        notice = (
+            f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}\n"
+            "I'll keep working until the goal is done, you pause/clear it, or the budget is exhausted.\n"
+            "Controls: /goal status · /goal pause · /goal resume · /goal clear"
+        )
+        # Send the goal text as the kickoff prompt. The TUI client sees
+        # {type: send, notice, message} → renders `notice` as a sys line,
+        # then submits `message` as a user turn. The post-turn judge
+        # wired in _run_prompt_submit takes over from there.
+        return _ok(
+            rid,
+            {"type": "send", "notice": notice, "message": state.goal},
+        )
 
     return _err(rid, 4018, f"not a quick/plugin/skill command: {name}")
 
@@ -4737,6 +4886,7 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     try:
         from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
 
         session = _sessions.get(params.get("session_id", ""))
         agent = session.get("agent") if session else None
@@ -4750,6 +4900,127 @@ def _(rid, params: dict) -> dict:
         # provider_model_ids() — that bypasses curation and pulls in
         # non-agentic models (e.g. Nous /models returns ~400 IDs including
         # TTS, embeddings, rerankers, image/video generators).
+        user_provs = (
+            cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        )
+        custom_provs = (
+            cfg.get("custom_providers")
+            if isinstance(cfg.get("custom_providers"), list)
+            else []
+        )
+        authenticated = list_authenticated_providers(
+            current_provider=current_provider,
+            current_base_url=current_base_url,
+            current_model=current_model,
+            user_providers=user_provs,
+            custom_providers=custom_provs,
+            max_models=50,
+        )
+
+        # Mark authenticated providers and build lookup by slug
+        authed_map: dict = {}
+        authed_extra: list = []  # user-defined/custom not in CANONICAL_PROVIDERS
+        canonical_slugs = {e.slug for e in CANONICAL_PROVIDERS}
+        for p in authenticated:
+            p["authenticated"] = True
+            authed_map[p["slug"]] = p
+            if p["slug"] not in canonical_slugs:
+                authed_extra.append(p)
+
+        # Build final list in CANONICAL_PROVIDERS order, merging auth data
+        from hermes_cli.auth import PROVIDER_REGISTRY as _auth_reg
+        ordered: list = []
+        for entry in CANONICAL_PROVIDERS:
+            if entry.slug in authed_map:
+                ordered.append(authed_map[entry.slug])
+            else:
+                pconfig = _auth_reg.get(entry.slug)
+                auth_type = pconfig.auth_type if pconfig else "api_key"
+                key_env = pconfig.api_key_env_vars[0] if (pconfig and pconfig.api_key_env_vars) else ""
+                if auth_type == "api_key" and key_env:
+                    warning = f"paste {key_env} to activate"
+                else:
+                    warning = f"run `hermes model` to configure ({auth_type})"
+                ordered.append({
+                    "slug": entry.slug,
+                    "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
+                    "is_current": entry.slug == current_provider,
+                    "is_user_defined": False,
+                    "models": [],
+                    "total_models": 0,
+                    "source": "built-in",
+                    "authenticated": False,
+                    "auth_type": auth_type,
+                    "key_env": key_env,
+                    "warning": warning,
+                })
+
+        # Append user-defined/custom providers not in canonical list
+        ordered.extend(authed_extra)
+
+        return _ok(
+            rid,
+            {
+                "providers": ordered,
+                "model": current_model,
+                "provider": current_provider,
+            },
+        )
+    except Exception as e:
+        return _err(rid, 5033, str(e))
+
+
+@method("model.save_key")
+def _(rid, params: dict) -> dict:
+    """Save an API key for a provider, then return its refreshed model list.
+
+    Params:
+        slug: provider slug (e.g. "deepseek", "xai")
+        api_key: the key value to save
+
+    Returns the provider dict with models populated (same shape as
+    model.options entries) on success.
+    """
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        from hermes_cli.config import is_managed, save_env_value
+        from hermes_cli.model_switch import list_authenticated_providers
+
+        slug = (params.get("slug") or "").strip()
+        api_key = (params.get("api_key") or "").strip()
+        if not slug or not api_key:
+            return _err(rid, 4001, "slug and api_key are required")
+
+        if is_managed():
+            return _err(rid, 4006, "managed install — credentials are read-only")
+
+        pconfig = PROVIDER_REGISTRY.get(slug)
+        if not pconfig:
+            return _err(rid, 4002, f"unknown provider: {slug}")
+        if pconfig.auth_type != "api_key":
+            return _err(
+                rid, 4003,
+                f"{pconfig.name} uses {pconfig.auth_type} auth — "
+                f"run `hermes model` to configure"
+            )
+        if not pconfig.api_key_env_vars:
+            return _err(rid, 4004, f"no env var defined for {pconfig.name}")
+
+        # Save the key to ~/.hermes/.env
+        env_var = pconfig.api_key_env_vars[0]
+        save_env_value(env_var, api_key)
+        # Also set in current process so list_authenticated_providers sees it
+        import os
+        os.environ[env_var] = api_key
+
+        # Refresh provider data
+        cfg = _load_cfg()
+        session = _sessions.get(params.get("session_id", ""))
+        agent = session.get("agent") if session else None
+        current_provider = getattr(agent, "provider", "") or ""
+        current_model = getattr(agent, "model", "") or _resolve_model()
+        current_base_url = getattr(agent, "base_url", "") or ""
+
         providers = list_authenticated_providers(
             current_provider=current_provider,
             current_base_url=current_base_url,
@@ -4764,16 +5035,72 @@ def _(rid, params: dict) -> dict:
             ),
             max_models=50,
         )
-        return _ok(
-            rid,
-            {
-                "providers": providers,
-                "model": current_model,
-                "provider": current_provider,
-            },
-        )
+
+        # Find the newly-authenticated provider
+        provider_data = None
+        for p in providers:
+            if p["slug"] == slug:
+                provider_data = p
+                break
+
+        if not provider_data:
+            # Key was saved but provider didn't appear — still return success
+            provider_data = {
+                "slug": slug,
+                "name": pconfig.name,
+                "is_current": False,
+                "models": [],
+                "total_models": 0,
+                "authenticated": True,
+            }
+
+        provider_data["authenticated"] = True
+        return _ok(rid, {"provider": provider_data})
     except Exception as e:
-        return _err(rid, 5033, str(e))
+        return _err(rid, 5034, str(e))
+
+
+@method("model.disconnect")
+def _(rid, params: dict) -> dict:
+    """Remove credentials for a provider.
+
+    Params:
+        slug: provider slug (e.g. "deepseek", "xai")
+
+    Returns success status and the provider's slug.
+    """
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY, clear_provider_auth
+        from hermes_cli.config import remove_env_value
+
+        slug = (params.get("slug") or "").strip()
+        if not slug:
+            return _err(rid, 4001, "slug is required")
+
+        pconfig = PROVIDER_REGISTRY.get(slug)
+        cleared_env = False
+        cleared_auth = False
+
+        # Remove API key env vars from .env and process
+        if pconfig and pconfig.api_key_env_vars:
+            for ev in pconfig.api_key_env_vars:
+                if remove_env_value(ev):
+                    cleared_env = True
+
+        # Clear OAuth / credential pool state
+        cleared_auth = clear_provider_auth(slug)
+
+        if not cleared_env and not cleared_auth:
+            return _err(rid, 4005, f"no credentials found for {slug}")
+
+        provider_name = pconfig.name if pconfig else slug
+        return _ok(rid, {
+            "slug": slug,
+            "name": provider_name,
+            "disconnected": True,
+        })
+    except Exception as e:
+        return _err(rid, 5035, str(e))
 
 
 # ── Methods: slash.exec ──────────────────────────────────────────────

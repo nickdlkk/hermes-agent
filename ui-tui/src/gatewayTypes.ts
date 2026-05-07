@@ -47,7 +47,7 @@ export type CommandDispatchResponse =
   | { output?: string; type: 'exec' | 'plugin' }
   | { target: string; type: 'alias' }
   | { message?: string; name: string; type: 'skill' }
-  | { message: string; type: 'send' }
+  | { message: string; notice?: string; type: 'send' }
 
 // ── Config ───────────────────────────────────────────────────────────
 
@@ -302,7 +302,10 @@ export interface ToolsConfigureResponse {
 // ── Model picker ─────────────────────────────────────────────────────
 
 export interface ModelOptionProvider {
+  auth_type?: string
+  authenticated?: boolean
   is_current?: boolean
+  key_env?: string
   models?: string[]
   name: string
   slug: string
