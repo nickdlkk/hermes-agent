@@ -2366,6 +2366,7 @@ async def delete_cron_job(job_id: str):
 class ProfileCreate(BaseModel):
     name: str
     clone_from_default: bool = False
+    no_skills: bool = False
 
 
 class ProfileRename(BaseModel):
@@ -2471,11 +2472,13 @@ async def create_profile_endpoint(body: ProfileCreate):
             name=body.name,
             clone_from="default" if body.clone_from_default else None,
             clone_config=body.clone_from_default,
+            no_skills=body.no_skills,
         )
         # Match the CLI's profile-create flow: fresh named profiles get the
         # bundled skills installed. When cloning from default, create_profile()
         # has already copied the source profile's skills, including any
-        # user-installed skills.
+        # user-installed skills. When no_skills=True, create_profile() wrote
+        # the opt-out marker and seed_profile_skills() will no-op.
         if not body.clone_from_default:
             profiles_mod.seed_profile_skills(path, quiet=True)
 
@@ -3260,8 +3263,9 @@ def mount_spa(application: FastAPI):
 # Built-in dashboard themes — label + description only.  The actual color
 # definitions live in the frontend (web/src/themes/presets.ts).
 _BUILTIN_DASHBOARD_THEMES = [
-    {"name": "default",   "label": "Hermes Teal",  "description": "Classic dark teal — the canonical Hermes look"},
-    {"name": "midnight",  "label": "Midnight",      "description": "Deep blue-violet with cool accents"},
+    {"name": "default",       "label": "Hermes Teal",         "description": "Classic dark teal — the canonical Hermes look"},
+    {"name": "default-large", "label": "Hermes Teal (Large)", "description": "Hermes Teal with bigger fonts and roomier spacing"},
+    {"name": "midnight",      "label": "Midnight",            "description": "Deep blue-violet with cool accents"},
     {"name": "ember",     "label": "Ember",          "description": "Warm crimson and bronze — forge vibes"},
     {"name": "mono",      "label": "Mono",           "description": "Clean grayscale — minimal and focused"},
     {"name": "cyberpunk", "label": "Cyberpunk",      "description": "Neon green on black — matrix terminal"},
