@@ -3667,6 +3667,15 @@ class AIAgent:
                             )
                         except Exception:
                             pass
+                else:
+                    # Still notify so the user knows review ran — just nothing
+                    # worth saving was found this pass.
+                    _bg_cb = self.background_review_callback
+                    if _bg_cb:
+                        try:
+                            _bg_cb("💾 Self-improvement review: nothing new to save")
+                        except Exception:
+                            pass
 
             except Exception as e:
                 logger.warning("Background memory/skill review failed: %s", e)
