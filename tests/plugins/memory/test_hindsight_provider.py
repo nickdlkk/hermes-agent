@@ -1428,6 +1428,146 @@ class TestSharedEventLoopLifecycle:
         assert provider._client is None
 
 
+class TestOnSessionEnd:
+    """Tests for the on_session_end() hook that flushes buffered turns
+    at real session boundaries (CLI exit, /reset, gateway expiry).
+    """
+
+    def test_on_session_end_flushes_partial_buffer(self, provider_with_config):
+        """retain_every_n_turns > 1 must not silently drop the final
+        partial buffer when the session ends normally."""
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        # Turns 1+2 are buffered (boundary at 3 is not reached).
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+        assert p._sync_thread is None  # no retain fired yet
+        p._client.aretain_batch.assert_not_called()
+
+        # Session ends normally — partial buffer must be flushed.
+        p.on_session_end([])
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_called_once()
+        kw = p._client.aretain_batch.call_args.kwargs
+        content = json.loads(kw["items"][0]["content"])
+        flat = json.dumps(content)
+        assert "turn1-user" in flat
+        assert "turn2-user" in flat
+        assert kw["items"][0]["metadata"]["turn_index"] == "2"
+
+    def test_on_session_end_no_spurious_flush_when_buffer_empty(
+        self, provider_with_config
+    ):
+        """on_session_end() with no buffered turns must not fire a retain."""
+        p = provider_with_config(retain_every_n_turns=3)
+        # Buffer is already empty.
+        p.on_session_end([])
+        p._retain_queue.join()
+        p._client.aretain_batch.assert_not_called()
+
+    def test_on_session_end_serializes_behind_pending_sync_turn(
+        self, provider_with_config
+    ):
+        """on_session_end() must ride the writer queue behind any in-flight
+        sync_turn retain, not race it on a separate thread.
+
+        We verify this by ensuring the flush is enqueued (queue size grows)
+        while a sync retain is still blocked in the writer, proving the
+        flush does not bypass the queue.
+        """
+        import threading
+
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+        gate = threading.Event()
+        p._client.aretain_batch = AsyncMock(side_effect=lambda **kw: gate.wait(timeout=5.0))
+
+        # turn1: buffer only (not a boundary with n=2).
+        p.sync_turn("turn1-user", "turn1-asst")
+        assert p._retain_queue.qsize() == 0
+
+        # turn2: boundary — retain is queued; writer picks it up and blocks at gate.
+        p.sync_turn("turn2-user", "turn2-asst")
+        assert p._retain_queue.qsize() == 1  # one pending job in queue
+
+        # turn3: buffer only.
+        p.sync_turn("turn3-user", "turn3-asst")
+
+        # on_session_end: flush closure is enqueued behind the blocked sync retain.
+        p.on_session_end([])
+        assert p._retain_queue.qsize() == 2  # flush is now waiting in queue
+
+        # The flush has NOT run yet — releasing the gate lets the queued flush run.
+        gate.set()
+        p._retain_queue.join()
+
+        # Both the sync retain and the flush completed (2 aretain_batch calls).
+        assert p._client.aretain_batch.call_count == 2
+
+    def test_on_session_end_respects_shutdown_guard(self, provider_with_config):
+        """Once shutdown() has set _shutting_down, on_session_end() is a no-op."""
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+
+        # Simulate shutdown already in progress.
+        p._shutting_down.set()
+        p.on_session_end([])  # should be ignored
+        p._retain_queue.join()
+
+        # No flush fired — shutdown gate blocked it.
+        p._client.aretain_batch.assert_not_called()
+
+    def test_on_session_end_messages_arg_ignored(
+        self, provider_with_config
+    ):
+        """The messages list passed to on_session_end() is accepted for ABC
+        compatibility but does NOT replace Hindsight's own turn buffer."""
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        p.sync_turn("real-turn-user", "real-turn-asst")
+
+        fake_history = [
+            {"role": "user", "content": "should-not-appear"},
+        ]
+        p.on_session_end(fake_history)
+        p._retain_queue.join()
+
+        kw = p._client.aretain_batch.call_args.kwargs
+        raw = kw["items"][0]["content"]
+        assert "should-not-appear" not in raw
+        assert "real-turn-user" in raw
+
+    def test_on_session_end_does_not_start_writer_when_buffer_empty(
+        self, provider,
+    ):
+        """on_session_end() on an empty buffer must not start the writer thread."""
+        assert provider._writer_thread is None
+        provider.on_session_end([])
+        assert provider._writer_thread is None
+
+    def test_on_session_end_clears_buffer_after_flush(
+        self, provider_with_config
+    ):
+        """After on_session_end() flushes, _session_turns is cleared so a
+        second call is a no-op even if retain_async=True (writer has not
+        yet processed the enqueued flush)."""
+        p = provider_with_config(retain_every_n_turns=3, retain_async=True)
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+        # Buffer still holds [turn1, turn2] — writer hasn't cleared it yet.
+
+        p.on_session_end([])  # enqueues flush, clears buffer immediately
+
+        # Buffer is now empty.
+        assert p._session_turns == []
+
+        # Second call is a no-op even though writer hasn't run yet.
+        p.on_session_end([])
+        p._retain_queue.join()
+
+        # Only one aretain_batch call (from the first on_session_end).
+        assert p._client.aretain_batch.call_count == 1
+
+
 class TestShutdown:
     def test_local_embedded_shutdown_closes_inner_async_client_on_shared_loop(self, provider):
         inner_client = _make_mock_client()
