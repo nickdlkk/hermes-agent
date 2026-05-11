@@ -1553,6 +1553,94 @@ class HindsightMemoryProvider(MemoryProvider):
 
         return tool_error(f"Unknown tool: {tool_name}")
 
+    def _flush_session_turns(self) -> None:
+        """Flush buffered session turns to Hindsight if any are accumulated.
+
+        Called by both ``on_session_end()`` (normal session boundary) and
+        ``shutdown()`` (safety net for atexit / direct kill paths). Uses the
+        same writer-queue pattern as ``on_session_switch()`` so retains are
+        serialized behind any in-flight ``sync_turn()`` flushes.
+
+        If the buffer is empty this is a no-op. After enqueueing the flush
+        job the accumulated turns list is cleared so a second ``shutdown()``
+        call (e.g. via atexit after a prior ``shutdown()`` that was reached
+        through ``on_session_end()``) finds nothing to re-flush.
+        """
+        if not self._session_turns:
+            return
+
+        # Snapshot everything before mutating self._* so metadata + tags +
+        # doc_id all reference the current session consistently.
+        old_turns = list(self._session_turns)
+        old_session_id = self._session_id
+        old_parent_session_id = self._parent_session_id
+        old_turn_index = self._turn_index
+        old_metadata = self._build_metadata(
+            message_count=len(old_turns) * 2,
+            turn_index=old_turn_index,
+        )
+        old_lineage_tags: list[str] = []
+        if old_session_id:
+            old_lineage_tags.append(f"session:{old_session_id}")
+        if old_parent_session_id:
+            old_lineage_tags.append(f"parent:{old_parent_session_id}")
+        old_content = "[" + ",".join(old_turns) + "]"
+        old_document_id, old_update_mode = self._resolve_retain_target(self._document_id)
+
+        def _flush() -> None:
+            try:
+                item = self._build_retain_kwargs(
+                    old_content,
+                    context=self._retain_context,
+                    metadata=old_metadata,
+                    tags=old_lineage_tags or None,
+                )
+                item.pop("bank_id", None)
+                item.pop("retain_async", None)
+                if old_update_mode is not None:
+                    item["update_mode"] = old_update_mode
+                logger.debug(
+                    "Hindsight flush-on-end: bank=%s, doc=%s, mode=%s, num_turns=%d",
+                    self._bank_id, old_document_id, old_update_mode, len(old_turns),
+                )
+                self._run_hindsight_operation(
+                    lambda client: client.aretain_batch(
+                        bank_id=self._bank_id,
+                        items=[item],
+                        document_id=old_document_id,
+                        retain_async=self._retain_async,
+                    )
+                )
+            except Exception as e:
+                logger.warning("Hindsight flush-on-end failed: %s", e, exc_info=True)
+
+        # Guard: skip enqueue if shutdown has already started (the writer
+        # is draining and will exit). This is the normal-path guard; the
+        # atexit / direct-kill safety net lives in shutdown() itself.
+        if self._shutting_down.is_set():
+            return
+
+        self._ensure_writer()
+        self._register_atexit()
+        self._retain_queue.put(_flush)
+        # Clear immediately so a second shutdown() call is a no-op.
+        self._session_turns = []
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Called at a real session boundary (CLI exit, /reset, gateway expiry).
+
+        Flushes any buffered turns that have not yet reached the N-turn
+        threshold, so the last few turns of a conversation are not lost
+        when the session ends. ``messages`` (full conversation history) is
+        accepted for ABC compatibility but Hindsight's turn buffer is used
+        internally to build the retain payload.
+
+        NOT called per-turn — only at actual session boundaries.
+        """
+        if self._shutting_down.is_set():
+            return
+        self._flush_session_turns()
+
     def on_session_switch(
         self,
         new_session_id: str,
@@ -1683,7 +1771,30 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
-        # Stop accepting new retain jobs first so anyone still calling
+        # Safety net: flush any remaining buffered turns. This handles the
+        # atexit path where shutdown() is called directly without on_session_end()
+        # having fired (e.g. os._exit() or emergency signal).
+        #
+        # When retain_async=True, the writer processes queued jobs asynchronously.
+        # If on_session_end() ran first it already queued a flush; the writer
+        # will drain the queue including those turns. In that case _session_turns
+        # still holds buffered-but-queued content (not yet cleared), so we must
+        # NOT re-enqueue a duplicate flush here — that would call aretain_batch
+        # a third time with the same turns.
+        #
+        # The safety net is needed when:
+        #   (a) retain_async=False  — buffer is cleared synchronously, so if
+        #       on_session_end() never ran the buffer still has unflushed turns
+        #   (b) retain_async=True AND queue is empty  — on_session_end() hasn't
+        #       run and the writer has nothing to process; we must flush the
+        #       buffer ourselves before the process exits.
+        #
+        # In all other cases the writer (when retained_async=True) or the
+        # sync_turn path (when retain_async=False) will eventually process
+        # _session_turns without our help.
+        if not self._retain_async or self._retain_queue.empty():
+            self._flush_session_turns()
+        # Stop accepting new retain jobs so anyone still calling
         # sync_turn() during teardown is dropped, not enqueued.
         self._shutting_down.set()
         # Drain the writer: it will finish in-flight work, then exit on
