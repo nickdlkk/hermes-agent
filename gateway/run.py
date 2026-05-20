@@ -15922,10 +15922,11 @@ class GatewayRunner:
                         if can_edit:
                             # First tool: send all accumulated text as new message
                             full_text = "\n".join(progress_lines)
-                        if result.success and result.message_id:
-                            progress_msg_id = result.message_id
-                            if _cleanup_progress:
-                                _cleanup_msg_ids.append(str(result.message_id))
+                            result = await _send_progress_text(full_text)
+                            if result.success and result.message_id:
+                                progress_msg_id = result.message_id
+                                if _cleanup_progress:
+                                    _cleanup_msg_ids.append(str(result.message_id))
 
                     _last_edit_ts = time.monotonic()
 
