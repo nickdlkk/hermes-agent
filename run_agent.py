@@ -3879,6 +3879,9 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        from agent.conversation_loop import run_conversation as _run_conv
+        return _run_conv(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
