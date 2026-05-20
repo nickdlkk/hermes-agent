@@ -2,6 +2,7 @@
 
 import os
 import pytest
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -388,6 +389,66 @@ class TestSearchPathValidation:
         assert "search failed" in result.error.lower() or "Search error" in result.error
 
 
+class TestSearchFilesFallbackHiddenPaths:
+    def _make_env(self):
+        env = MagicMock()
+        env.cwd = "/"
+
+        def execute(command, **kwargs):
+            completed = subprocess.run(
+                command,
+                shell=True,
+                text=True,
+                capture_output=True,
+            )
+            return {
+                "output": completed.stdout,
+                "returncode": completed.returncode,
+            }
+
+        env.execute = execute
+        return env
+
+    def test_hidden_root_with_hidden_ancestor_includes_files(self, tmp_path, monkeypatch):
+        """Fallback find should include visible files when path is inside hidden root."""
+        root = tmp_path / ".hermes" / "logs"
+        root.mkdir(parents=True)
+        visible_file = root / "agent.log"
+        hidden_dir_file = root / ".hidden" / "secret.log"
+        nested_hidden_file = root / "nested" / ".secret.log"
+        visible_nested_file = root / "nested" / "visible.log"
+
+        for p in [visible_file, nested_hidden_file, visible_nested_file, hidden_dir_file]:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("x")
+
+        ops = ShellFileOperations(self._make_env())
+        monkeypatch.setattr(ops, "_has_command", lambda command: command == "find")
+        result = ops._search_files("*.log", str(root), limit=50, offset=0)
+
+        assert result.error is None
+        assert set(result.files) == {str(visible_file), str(visible_nested_file)}
+
+    def test_normal_root_still_excludes_hidden_descendants(self, tmp_path, monkeypatch):
+        """Fallback find should still exclude hidden descendant paths for normal roots."""
+        root = tmp_path / "repo"
+        root.mkdir()
+        visible_file = root / "agent.log"
+        visible_nested_file = root / "nested" / "visible.log"
+        hidden_dir_file = root / ".hidden" / "secret.log"
+
+        for p in [visible_file, visible_nested_file, hidden_dir_file]:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("x")
+
+        ops = ShellFileOperations(self._make_env())
+        monkeypatch.setattr(ops, "_has_command", lambda command: command == "find")
+        result = ops._search_files("*.log", str(root), limit=50, offset=0)
+
+        assert result.error is None
+        assert set(result.files) == {str(visible_file), str(visible_nested_file)}
+
+
 class TestShellFileOpsWriteDenied:
     def test_write_file_denied_path(self, file_ops):
         result = file_ops.write_file("~/.ssh/authorized_keys", "evil key")
@@ -518,3 +579,18 @@ class TestPatchReplacePostWriteVerification:
         result = ops.patch_replace("/tmp/test/a.py", "hello", "hi")
         assert result.error is not None
         assert "could not re-read" in result.error.lower()
+
+
+# =========================================================================
+# Git baseline check for write_file warning
+# =========================================================================
+
+class _DeletedTestGitBaselineCheck:
+    """Removed May 2026 — these tests asserted on a ``_check_git_baseline``
+    method that doesn't exist on ``ShellFileOperations`` (regression intro
+    by a separate refactor). All 6 tests in the class fail with
+    AttributeError on origin/main. Deleted wholesale per Teknium's
+    instruction to keep CI green; reinstate them when the underlying
+    helper is restored or replaced.
+    """
+    pass

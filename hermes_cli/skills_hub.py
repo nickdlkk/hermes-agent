@@ -303,7 +303,7 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
     _PER_SOURCE_LIMIT = {
         "official": 200, "skills-sh": 200, "well-known": 50,
         "github": 200, "clawhub": 500, "claude-marketplace": 100,
-        "lobehub": 500,
+        "lobehub": 500, "browse-sh": 500,
     }
 
     with c.status("[bold]Fetching skills from registries..."):
@@ -593,7 +593,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
             answer = input("Confirm [y/N]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             answer = "n"
-        if answer not in ("y", "yes"):
+        if answer not in {"y", "yes"}:
             c.print("[dim]Installation cancelled.[/]\n")
             shutil.rmtree(q_path, ignore_errors=True)
             return
@@ -684,7 +684,7 @@ def browse_skills(page: int = 1, page_size: int = 20, source: str = "all") -> di
     page_size = max(1, min(page_size, 100))
     _TRUST_RANK = {"builtin": 3, "trusted": 2, "community": 1}
     _PER_SOURCE_LIMIT = {"official": 100, "skills-sh": 100, "well-known": 25, "github": 100, "clawhub": 50,
-                         "claude-marketplace": 50, "lobehub": 50}
+                         "claude-marketplace": 50, "lobehub": 50, "browse-sh": 500}
     auth = GitHubAuth()
     sources = create_source_router(auth)
     all_results: list = []
@@ -948,7 +948,7 @@ def do_uninstall(name: str, console: Optional[Console] = None,
             answer = input("Confirm [y/N]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             answer = "n"
-        if answer not in ("y", "yes"):
+        if answer not in {"y", "yes"}:
             c.print("[dim]Cancelled.[/]\n")
             return
 
@@ -984,7 +984,7 @@ def do_reset(name: str, restore: bool = False,
             answer = input("Confirm [y/N]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             answer = "n"
-        if answer not in ("y", "yes"):
+        if answer not in {"y", "yes"}:
             c.print("[dim]Cancelled.[/]\n")
             return
 
@@ -1138,7 +1138,7 @@ def _github_publish(skill_path: Path, skill_name: str, target_repo: str,
             f"https://api.github.com/repos/{target_repo}/forks",
             headers=headers, timeout=30,
         )
-        if resp.status_code in (200, 202):
+        if resp.status_code in {200, 202}:
             fork = resp.json()
             fork_repo = fork["full_name"]
         elif resp.status_code == 403:
@@ -1257,7 +1257,7 @@ def do_snapshot_export(output_path: str, console: Optional[Console] = None) -> N
         sys.stdout.write(payload)
     else:
         out = Path(output_path)
-        out.write_text(payload)
+        out.write_text(payload, encoding="utf-8")
         c.print(f"[bold green]Snapshot exported:[/] {out}")
         c.print(f"[dim]{len(installed)} skill(s), {len(tap_list)} tap(s)[/]\n")
 
@@ -1274,7 +1274,7 @@ def do_snapshot_import(input_path: str, force: bool = False,
         return
 
     try:
-        snapshot = json.loads(inp.read_text())
+        snapshot = json.loads(inp.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         c.print(f"[bold red]Error:[/] Invalid JSON in {inp}\n")
         return
@@ -1564,7 +1564,7 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         repo = args[1] if len(args) > 1 else ""
         do_tap(tap_action, repo=repo, console=c)
 
-    elif action in ("help", "--help", "-h"):
+    elif action in {"help", "--help", "-h"}:
         _print_skills_help(c)
 
     else:

@@ -156,6 +156,9 @@ _MARKDOWN_HINT_RE = re.compile(
     r"(^#{1,6}\s)|(^\s*[-*]\s)|(^\s*\d+\.\s)|(^\s*---+\s*$)|(```)|(`[^`\n]+`)|(\*\*[^*\n].+?\*\*)|(~~[^~\n].+?~~)|(<u>.+?</u>)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)]+\))|(^>\s)|(^\s*\|.+?\|)",
     re.MULTILINE,
 )
+# Detect markdown tables: a line starting with | followed by a separator line.
+# Feishu post-type 'md' elements do not render tables, so we force text mode.
+_MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
@@ -432,7 +435,7 @@ RejectReason = Literal[
 
 def _is_bot_sender(sender: Any) -> bool:
     # receive_v1 docs say {user, bot}; accept "app" defensively.
-    return getattr(sender, "sender_type", "") in ("bot", "app")
+    return getattr(sender, "sender_type", "") in {"bot", "app"}
 
 
 def _sender_identity(sender: Any) -> frozenset:
@@ -1541,12 +1544,12 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         except Exception:
             logger.debug("[Feishu] Failed to apply websocket runtime overrides", exc_info=True)
 
-    async def _connect_with_overrides(*args: Any, **kwargs: Any) -> Any:
+    def _connect_with_overrides(*args: Any, **kwargs: Any) -> Any:
         if adapter._ws_ping_interval is not None and "ping_interval" not in kwargs:
             kwargs["ping_interval"] = adapter._ws_ping_interval
         if adapter._ws_ping_timeout is not None and "ping_timeout" not in kwargs:
             kwargs["ping_timeout"] = adapter._ws_ping_timeout
-        return await original_connect(*args, **kwargs)
+        return original_connect(*args, **kwargs)
 
     def _configure_with_overrides(conf: Any) -> Any:
         if original_configure is None:
@@ -1584,8 +1587,65 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
 
 
 def check_feishu_requirements() -> bool:
-    """Check if Feishu/Lark dependencies are available."""
-    return FEISHU_AVAILABLE
+    """Check if Feishu/Lark dependencies are available.
+
+    Lazy-installs lark-oapi via ``tools.lazy_deps.ensure("platform.feishu")``
+    on first call if not present. Rebinds all module-level globals on success.
+    """
+    if FEISHU_AVAILABLE:
+        return True
+
+    def _import():
+        import lark_oapi as lark
+        from lark_oapi.api.application.v6 import GetApplicationRequest
+        from lark_oapi.api.im.v1 import (
+            CreateFileRequest, CreateFileRequestBody,
+            CreateImageRequest, CreateImageRequestBody,
+            CreateMessageRequest, CreateMessageRequestBody,
+            GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
+            P2ImMessageMessageReadV1,
+            ReplyMessageRequest, ReplyMessageRequestBody,
+            UpdateMessageRequest, UpdateMessageRequestBody,
+        )
+        from lark_oapi.core import AccessTokenType, HttpMethod
+        from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
+        from lark_oapi.core.model import BaseRequest
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            CallBackCard, P2CardActionTriggerResponse,
+        )
+        from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+        from lark_oapi.ws import Client as FeishuWSClient
+        return {
+            "lark": lark,
+            "GetApplicationRequest": GetApplicationRequest,
+            "CreateFileRequest": CreateFileRequest,
+            "CreateFileRequestBody": CreateFileRequestBody,
+            "CreateImageRequest": CreateImageRequest,
+            "CreateImageRequestBody": CreateImageRequestBody,
+            "CreateMessageRequest": CreateMessageRequest,
+            "CreateMessageRequestBody": CreateMessageRequestBody,
+            "GetChatRequest": GetChatRequest,
+            "GetMessageRequest": GetMessageRequest,
+            "GetMessageResourceRequest": GetMessageResourceRequest,
+            "P2ImMessageMessageReadV1": P2ImMessageMessageReadV1,
+            "ReplyMessageRequest": ReplyMessageRequest,
+            "ReplyMessageRequestBody": ReplyMessageRequestBody,
+            "UpdateMessageRequest": UpdateMessageRequest,
+            "UpdateMessageRequestBody": UpdateMessageRequestBody,
+            "AccessTokenType": AccessTokenType,
+            "HttpMethod": HttpMethod,
+            "FEISHU_DOMAIN": FEISHU_DOMAIN,
+            "LARK_DOMAIN": LARK_DOMAIN,
+            "BaseRequest": BaseRequest,
+            "CallBackCard": CallBackCard,
+            "P2CardActionTriggerResponse": P2CardActionTriggerResponse,
+            "EventDispatcherHandler": EventDispatcherHandler,
+            "FeishuWSClient": FeishuWSClient,
+            "FEISHU_AVAILABLE": True,
+        }
+
+    from tools.lazy_deps import ensure_and_bind
+    return ensure_and_bind("platform.feishu", _import, globals(), prompt=False)
 
 
 class FeishuAdapter(BasePlatformAdapter):
@@ -1652,6 +1712,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        # Update prompt button state (prompt_id → {session_key, message_id, chat_id})
+        self._update_prompt_state: Dict[int, Dict[str, str]] = {}
+        self._update_prompt_counter = itertools.count(1)
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
@@ -1674,8 +1737,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     per_chat_require_mention = _to_boolean(rule_cfg.get("require_mention"))
                 group_rules[str(chat_id)] = FeishuGroupRule(
                     policy=str(rule_cfg.get("policy", "open")).strip().lower(),
-                    allowlist=set(str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()),
-                    blacklist=set(str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()),
+                    allowlist={str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()},
+                    blacklist={str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()},
                     require_mention=per_chat_require_mention,
                 )
 
@@ -1689,7 +1752,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Env-only so adapter and gateway auth bypass share one source; yaml
         # feishu.allow_bots is bridged to this env var at config load.
         allow_bots = os.getenv("FEISHU_ALLOW_BOTS", "none").strip().lower()
-        if allow_bots not in ("none", "mentions", "all"):
+        if allow_bots not in {"none", "mentions", "all"}:
             logger.warning(
                 "[Feishu] Unknown allow_bots=%r, falling back to 'none'. Valid: none, mentions, all.",
                 allow_bots,
@@ -2427,6 +2490,74 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     @staticmethod
+    def _build_update_prompt_card(*, prompt: str, default: str, prompt_id: int) -> Dict[str, Any]:
+        default_hint = f"\n\nDefault: `{default}`" if default else ""
+
+        def _btn(label: str, answer: str, btn_type: str) -> dict:
+            return {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": label},
+                "type": btn_type,
+                "value": {
+                    "hermes_update_prompt_action": answer,
+                    "update_prompt_id": prompt_id,
+                },
+            }
+
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "⚕ Update Needs Your Input", "tag": "plain_text"},
+                "template": "orange",
+            },
+            "elements": [
+                {"tag": "markdown", "content": f"{prompt}{default_hint}"},
+                {
+                    "tag": "action",
+                    "actions": [
+                        _btn("✓ Yes", "y", "primary"),
+                        _btn("✗ No", "n", "danger"),
+                    ],
+                },
+            ],
+        }
+
+    async def send_update_prompt(
+        self, chat_id: str, prompt: str, default: str = "",
+        session_key: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an interactive update prompt with Yes/No buttons."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            prompt_id = next(self._update_prompt_counter)
+            payload = json.dumps(
+                self._build_update_prompt_card(prompt=prompt, default=default, prompt_id=prompt_id),
+                ensure_ascii=False,
+            )
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=None,
+                metadata=metadata,
+            )
+
+            result = self._finalize_send_result(response, "send_update_prompt failed")
+            if result.success:
+                self._update_prompt_state[prompt_id] = {
+                    "session_key": session_key,
+                    "message_id": result.message_id or "",
+                    "chat_id": chat_id,
+                }
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] send_update_prompt failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    @staticmethod
     def _build_resolved_approval_card(*, choice: str, user_name: str) -> Dict[str, Any]:
         """Build raw card JSON for a resolved approval action."""
         icon = "❌" if choice == "deny" else "✅"
@@ -2444,6 +2575,28 @@ class FeishuAdapter(BasePlatformAdapter):
                 },
             ],
         }
+
+    @staticmethod
+    def _build_resolved_update_prompt_card(*, answer: str, user_name: str) -> Dict[str, Any]:
+        yes = answer == "y"
+        label = "Yes" if yes else "No"
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": f"{'✅' if yes else '❌'} Update prompt answered: {label}", "tag": "plain_text"},
+                "template": "green" if yes else "red",
+            },
+            "elements": [
+                {"tag": "markdown", "content": f"Answered by **{user_name}**"},
+            ],
+        }
+
+    @staticmethod
+    def _write_update_prompt_response(answer: str) -> None:
+        response_path = get_hermes_home() / ".update_response"
+        tmp_path = response_path.with_suffix(".tmp")
+        tmp_path.write_text(answer)
+        tmp_path.replace(response_path)
 
     async def send_voice(
         self,
@@ -2702,11 +2855,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     daemon=True,
                 ).start()
             return
-        future = asyncio.run_coroutine_threadsafe(
-            self._handle_message_event_data(data),
-            loop,
-        )
-        future.add_done_callback(self._log_background_failure)
+        self._submit_on_loop(loop, self._handle_message_event_data(data))
 
     def _enqueue_pending_inbound_event(self, data: Any) -> bool:
         """Append an event to the pending-inbound queue.
@@ -2782,16 +2931,12 @@ class FeishuAdapter(BasePlatformAdapter):
                     dispatched = 0
                     requeue: List[Any] = []
                     for event in batch:
-                        try:
-                            fut = asyncio.run_coroutine_threadsafe(
-                                self._handle_message_event_data(event),
-                                loop,
-                            )
-                            fut.add_done_callback(self._log_background_failure)
+                        if self._submit_on_loop(
+                            loop, self._handle_message_event_data(event)
+                        ):
                             dispatched += 1
-                        except RuntimeError:
-                            # Loop closed between check and submit — requeue
-                            # and poll again.
+                        else:
+                            # Loop closed/unavailable — requeue and poll again.
                             requeue.append(event)
                     if requeue:
                         with self._pending_inbound_lock:
@@ -2895,11 +3040,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._loop_accepts_callbacks(loop):
             logger.warning("[Feishu] Dropping drive comment event before adapter loop is ready")
             return
-        future = asyncio.run_coroutine_threadsafe(
-            handle_drive_comment_event(self._client, data, self_open_id=self._bot_open_id),
+        self._submit_on_loop(
             loop,
+            handle_drive_comment_event(self._client, data, self_open_id=self._bot_open_id),
         )
-        future.add_done_callback(self._log_background_failure)
 
     def _on_reaction_event(self, event_type: str, data: Any) -> None:
         """Route user reactions on bot messages as synthetic text events."""
@@ -2927,11 +3071,7 @@ class FeishuAdapter(BasePlatformAdapter):
             or bool(getattr(loop, "is_closed", lambda: False)())
         ):
             return
-        future = asyncio.run_coroutine_threadsafe(
-            self._handle_reaction_event(event_type, data),
-            loop,
-        )
-        future.add_done_callback(self._log_background_failure)
+        self._submit_on_loop(loop, self._handle_reaction_event(event_type, data))
 
     def _on_card_action_trigger(self, data: Any) -> Any:
         """Handle card-action callback from the Feishu SDK (synchronous).
@@ -2951,9 +3091,19 @@ class FeishuAdapter(BasePlatformAdapter):
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
+        update_prompt_action = (
+            action_value.get("hermes_update_prompt_action")
+            if isinstance(action_value, dict) else None
+        )
 
         if hermes_action:
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
+        if update_prompt_action:
+            return self._handle_update_prompt_card_action(
+                event=event,
+                action_value=action_value,
+                loop=loop,
+            )
 
         self._submit_on_loop(loop, self._handle_card_action_event(data))
         if P2CardActionTriggerResponse is None:
@@ -2965,10 +3115,29 @@ class FeishuAdapter(BasePlatformAdapter):
         """Return True when the adapter loop can accept thread-safe submissions."""
         return loop is not None and not bool(getattr(loop, "is_closed", lambda: False)())
 
-    def _submit_on_loop(self, loop: Any, coro: Any) -> None:
+    def _submit_on_loop(self, loop: Any, coro: Any) -> bool:
         """Schedule background work on the adapter loop with shared failure logging."""
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        from agent.async_utils import safe_schedule_threadsafe
+        future = safe_schedule_threadsafe(
+            coro, loop,
+            logger=logger,
+            log_message="[Feishu] Failed to schedule background callback work",
+            log_level=logging.WARNING,
+        )
+        if future is None:
+            return False
         future.add_done_callback(self._log_background_failure)
+        return True
+
+    def _is_interactive_operator_authorized(self, open_id: str) -> bool:
+        """Return whether this card-action operator may answer gated prompts."""
+        normalized = str(open_id or "").strip()
+        if not normalized:
+            return False
+        allowed_ids = set(self._admins) | set(self._allowed_group_users)
+        if not allowed_ids:
+            return True
+        return "*" in allowed_ids or normalized in allowed_ids
 
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""
@@ -2982,7 +3151,8 @@ class FeishuAdapter(BasePlatformAdapter):
         open_id = str(getattr(operator, "open_id", "") or "")
         user_name = self._get_cached_sender_name(open_id) or open_id
 
-        self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name))
+        if not self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name)):
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
         if P2CardActionTriggerResponse is None:
             return None
@@ -2991,6 +3161,41 @@ class FeishuAdapter(BasePlatformAdapter):
             card = CallBackCard()
             card.type = "raw"
             card.data = self._build_resolved_approval_card(choice=choice, user_name=user_name)
+            response.card = card
+        return response
+
+    def _handle_update_prompt_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
+        """Schedule update prompt resolution and build the synchronous callback response."""
+        prompt_id = action_value.get("update_prompt_id")
+        if prompt_id is None:
+            logger.debug("[Feishu] Card action missing update_prompt_id, ignoring")
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+        if prompt_id not in self._update_prompt_state:
+            logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        answer = str(action_value.get("hermes_update_prompt_action", "") or "").strip().lower()
+        if answer not in {"y", "n"}:
+            logger.debug("[Feishu] Card action has invalid update prompt answer=%r", answer)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        operator = getattr(event, "operator", None)
+        open_id = str(getattr(operator, "open_id", "") or "")
+        if not self._is_interactive_operator_authorized(open_id):
+            logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or "<unknown>")
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        user_name = self._get_cached_sender_name(open_id) or open_id
+        if not self._submit_on_loop(loop, self._resolve_update_prompt(prompt_id, answer, user_name)):
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        if P2CardActionTriggerResponse is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        if CallBackCard is not None:
+            card = CallBackCard()
+            card.type = "raw"
+            card.data = self._build_resolved_update_prompt_card(answer=answer, user_name=user_name)
             response.card = card
         return response
 
@@ -3009,6 +3214,21 @@ class FeishuAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
+
+    async def _resolve_update_prompt(self, prompt_id: Any, answer: str, user_name: str) -> None:
+        """Persist an update prompt answer for the detached update process."""
+        state = self._update_prompt_state.pop(prompt_id, None)
+        if not state:
+            logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
+            return
+        try:
+            self._write_update_prompt_response(answer)
+            logger.info(
+                "Feishu update prompt resolved for session %s (answer=%s, user=%s)",
+                state["session_key"], answer, user_name,
+            )
+        except Exception as exc:
+            logger.error("Failed to resolve Feishu update prompt: %s", exc)
 
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
         """Fetch the reacted-to message; if it was sent by this bot, emit a synthetic text event."""
@@ -3199,7 +3419,7 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _reactions_enabled(self) -> bool:
-        return os.getenv("FEISHU_REACTIONS", "true").strip().lower() not in ("false", "0", "no")
+        return os.getenv("FEISHU_REACTIONS", "true").strip().lower() not in {"false", "0", "no"}
 
     async def _add_reaction(self, message_id: str, emoji_type: str) -> Optional[str]:
         """Return the reaction_id on success, else None. The id is needed later for deletion."""
@@ -3669,7 +3889,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_bot_added_to_chat(data)
         elif event_type == "im.chat.member.bot.deleted_v1":
             self._on_bot_removed_from_chat(data)
-        elif event_type in ("im.message.reaction.created_v1", "im.message.reaction.deleted_v1"):
+        elif event_type in {"im.message.reaction.created_v1", "im.message.reaction.deleted_v1"}:
             self._on_reaction_event(event_type, data)
         elif event_type == "card.action.trigger":
             self._on_card_action_trigger(data)
@@ -4489,47 +4709,50 @@ class FeishuAdapter(BasePlatformAdapter):
         and self-sent bot event filtering.
 
         Populates ``_bot_open_id`` and ``_bot_name`` from /open-apis/bot/v3/info
-        (no extra scopes required beyond the tenant access token). Falls back to
-        the application info endpoint for ``_bot_name`` only when the first probe
-        doesn't return it. Each field is hydrated independently — a value already
-        supplied via env vars (FEISHU_BOT_OPEN_ID / FEISHU_BOT_USER_ID /
-        FEISHU_BOT_NAME) is preserved and skips its probe.
+        (no extra scopes required beyond the tenant access token). The probe
+        always runs when a client is available so stale env vars from app/bot
+        migrations do not break group @mention gating. Falls back to the
+        application info endpoint for ``_bot_name`` only when the first probe
+        doesn't return it. If the probe fails, env-provided values are preserved.
         """
         if not self._client:
-            return
-        if self._bot_open_id and self._bot_name:
-            # Everything the self-send filter and precise mention gate need is
-            # already in place; nothing to probe.
             return
 
         # Primary probe: /open-apis/bot/v3/info — returns bot_name + open_id, no
         # extra scopes required. This is the same endpoint the onboarding wizard
         # uses via probe_bot().
-        if not self._bot_open_id or not self._bot_name:
-            try:
-                req = (
-                    BaseRequest.builder()
-                    .http_method(HttpMethod.GET)
-                    .uri("/open-apis/bot/v3/info")
-                    .token_types({AccessTokenType.TENANT})
-                    .build()
-                )
-                resp = await asyncio.to_thread(self._client.request, req)
-                content = getattr(getattr(resp, "raw", None), "content", None)
-                if content:
-                    payload = json.loads(content)
-                    parsed = _parse_bot_response(payload) or {}
-                    open_id = (parsed.get("bot_open_id") or "").strip()
-                    bot_name = (parsed.get("bot_name") or "").strip()
-                    if open_id and not self._bot_open_id:
-                        self._bot_open_id = open_id
-                    if bot_name and not self._bot_name:
-                        self._bot_name = bot_name
-            except Exception:
-                logger.debug(
-                    "[Feishu] /bot/v3/info probe failed during hydration",
-                    exc_info=True,
-                )
+        try:
+            req = (
+                BaseRequest.builder()
+                .http_method(HttpMethod.GET)
+                .uri("/open-apis/bot/v3/info")
+                .token_types({AccessTokenType.TENANT})
+                .build()
+            )
+            resp = await asyncio.to_thread(self._client.request, req)
+            content = getattr(getattr(resp, "raw", None), "content", None)
+            if content:
+                payload = json.loads(content)
+                parsed = _parse_bot_response(payload) or {}
+                open_id = (parsed.get("bot_open_id") or "").strip()
+                bot_name = (parsed.get("bot_name") or "").strip()
+                if open_id:
+                    if self._bot_open_id and self._bot_open_id != open_id:
+                        logger.warning(
+                            "[Feishu] FEISHU_BOT_OPEN_ID is stale; using /bot/v3/info open_id for group @mention gating."
+                        )
+                    self._bot_open_id = open_id
+                if bot_name:
+                    if self._bot_name and self._bot_name != bot_name:
+                        logger.info(
+                            "[Feishu] FEISHU_BOT_NAME differs from /bot/v3/info; using hydrated bot name for group @mention gating."
+                        )
+                    self._bot_name = bot_name
+        except Exception:
+            logger.debug(
+                "[Feishu] /bot/v3/info probe failed during hydration",
+                exc_info=True,
+            )
 
         # Fallback probe for _bot_name only: application info endpoint. Needs
         # admin:app.info:readonly or application:application:self_manage scope,
@@ -4574,7 +4797,14 @@ class FeishuAdapter(BasePlatformAdapter):
         if isinstance(seen_data, list):
             entries: Dict[str, float] = {str(item).strip(): 0.0 for item in seen_data if str(item).strip()}
         elif isinstance(seen_data, dict):
-            entries = {k: float(v) for k, v in seen_data.items() if isinstance(k, str) and k.strip()}
+            entries = {}
+            for key, value in seen_data.items():
+                if not isinstance(key, str) or not key.strip():
+                    continue
+                try:
+                    entries[key] = float(value)
+                except (TypeError, ValueError):
+                    continue
         else:
             return
         # Filter out TTL-expired entries (entries saved with ts=0.0 are treated as immortal
@@ -5231,12 +5461,12 @@ def _poll_registration(
     Returns dict with app_id, app_secret, domain, open_id on success.
     Returns None on failure.
     """
-    deadline = time.time() + expire_in
+    deadline = time.monotonic() + expire_in
     current_domain = domain
     domain_switched = False
     poll_count = 0
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         base_url = _accounts_base_url(current_domain)
         try:
             res = _post_registration(base_url, {
@@ -5275,7 +5505,7 @@ def _poll_registration(
 
         # Terminal errors
         error = res.get("error", "")
-        if error in ("access_denied", "expired_token"):
+        if error in {"access_denied", "expired_token"}:
             if poll_count > 0:
                 print()
             logger.warning("[Feishu onboard] Registration %s", error)
