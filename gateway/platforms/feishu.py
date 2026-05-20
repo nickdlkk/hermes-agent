@@ -400,6 +400,7 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    topic_bypass_users: frozenset[str] = frozenset()  # user_ids/open_ids that bypass mention in topic threads
 
 
 @dataclass
@@ -1819,6 +1820,11 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            topic_bypass_users=frozenset(
+                item.strip()
+                for item in os.getenv("FEISHU_TOPIC_BYPASS_USERS", "").split(",")
+                if item.strip()
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1851,6 +1857,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._topic_bypass_users = set(settings.topic_bypass_users)
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -4595,10 +4602,11 @@ class FeishuAdapter(BasePlatformAdapter):
         ):
             return "group_policy_rejected"
         if require_mention and not self._mentions_self(message):
-            # Topic-thread messages bypass mention requirement — the user explicitly
-            # chose to interact inside a topic, so @mention is redundant friction.
             thread_id = getattr(message, "thread_id", None) or None
             if not thread_id:
+                return "group_policy_rejected"
+            # Bypass mention only if sender is in the bypass list
+            if not (sender_ids & self._topic_bypass_users):
                 return "group_policy_rejected"
         return None
 
