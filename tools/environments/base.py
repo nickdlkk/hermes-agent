@@ -7,9 +7,11 @@ or a temp file (local).
 """
 
 import codecs
+import ctypes
 import json
 import logging
 import os
+import platform
 import select
 import shlex
 import subprocess
@@ -18,6 +20,8 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+_IS_WINDOWS = platform.system() == "Windows"
 from typing import IO, Callable, Protocol
 
 from hermes_constants import get_hermes_home
@@ -515,39 +519,44 @@ class BaseEnvironment(ABC):
         def _drain():
             nonlocal last_output_time, saw_output
             fd = proc.stdout.fileno()
-            idle_after_exit = 0
             try:
                 while True:
-                    try:
-                        ready, _, _ = select.select([fd], [], [], 0.1)
-                    except (ValueError, OSError):
-                        break  # fd already closed
-                    if ready:
+                    if _IS_WINDOWS:
                         try:
                             chunk = os.read(fd, 4096)
                         except (ValueError, OSError):
                             break
                         if not chunk:
-                            break  # true EOF — all writers closed
+                            break
                         decoded = decoder.decode(chunk)
                         output_chunks.append(decoded)
-                        # Activity-aware: track output for inactivity timeout
                         now = time.monotonic()
                         with activity_lock:
                             last_output_time = now
                             saw_output = True
-                        idle_after_exit = 0
-                    elif proc.poll() is not None:
-                        # bash is gone and the pipe was idle for ~100ms.  Give
-                        # it two more cycles to catch any buffered tail, then
-                        # stop — otherwise we wait forever on a grandchild pipe.
-                        idle_after_exit += 1
-                        if idle_after_exit >= 3:
+                    else:
+                        try:
+                            ready, _, _ = select.select([fd], [], [], 0.1)
+                        except (ValueError, OSError):
                             break
+                        if ready:
+                            try:
+                                chunk = os.read(fd, 4096)
+                            except (ValueError, OSError):
+                                break
+                            if not chunk:
+                                break
+                            decoded = decoder.decode(chunk)
+                            output_chunks.append(decoded)
+                            now = time.monotonic()
+                            with activity_lock:
+                                last_output_time = now
+                                saw_output = True
+                        elif proc.poll() is not None:
+                            # bash exited, pipe idle for ~100ms — stop soon.
+                            # Without this we'd wait forever on grandchild pipes.
+                            time.sleep(0.1)
             finally:
-                # Flush any bytes buffered mid-sequence.  With ``errors="replace"``
-                # this emits U+FFFD for any final incomplete sequence rather than
-                # raising.
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
@@ -603,6 +612,11 @@ class BaseEnvironment(ABC):
                             _tid, _pid, _iter_count, time.monotonic() - start_time,
                         )
                     self._kill_process(proc)
+                    if _IS_WINDOWS:
+                        try:
+                            proc.stdout.close()
+                        except Exception:
+                            pass
                     drain_thread.join(timeout=2)
                     return {
                         "output": "".join(output_chunks) + "\n[Command interrupted]",
@@ -617,6 +631,11 @@ class BaseEnvironment(ABC):
                             _tid, _pid, _iter_count, int(wall_timeout), int(timeout),
                         )
                     self._kill_process(proc)
+                    if _IS_WINDOWS:
+                        try:
+                            proc.stdout.close()
+                        except Exception:
+                            pass
                     drain_thread.join(timeout=2)
                     partial = "".join(output_chunks)
                     timeout_msg = (
@@ -638,6 +657,11 @@ class BaseEnvironment(ABC):
                             _tid, _pid, _iter_count, int(timeout),
                         )
                     self._kill_process(proc)
+                    if _IS_WINDOWS:
+                        try:
+                            proc.stdout.close()
+                        except Exception:
+                            pass
                     drain_thread.join(timeout=2)
                     partial = "".join(output_chunks)
                     timeout_msg = (
@@ -690,6 +714,11 @@ class BaseEnvironment(ABC):
                 )
             try:
                 self._kill_process(proc)
+                if _IS_WINDOWS:
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
                 drain_thread.join(timeout=2)
             except Exception:
                 pass  # cleanup is best-effort
@@ -698,12 +727,18 @@ class BaseEnvironment(ABC):
         # Drain thread now exits promptly after bash does (~300ms idle
         # check).  A short join is enough; a long one would be a bug since
         # it means the non-blocking loop itself stopped cooperating.
+        if _IS_WINDOWS:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
         drain_thread.join(timeout=2)
 
-        try:
-            proc.stdout.close()
-        except Exception:
-            pass
+        if not _IS_WINDOWS:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
 
         if _DEBUG_INTERRUPT:
             logger.info(
@@ -751,6 +786,7 @@ class BaseEnvironment(ABC):
 
         cwd_path = output[first + len(marker) : last].strip()
         if cwd_path:
+            logger.warning("[CWD-DEBUG] _extract_cwd_from_output: parsed cwd_path=%r, setting self.cwd", cwd_path)
             self.cwd = cwd_path
 
         # Strip the marker line AND the \n we injected before it.

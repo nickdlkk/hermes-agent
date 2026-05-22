@@ -1,5 +1,6 @@
 """Local execution environment — spawn-per-call with session snapshot."""
 
+import logging
 import os
 import platform
 import shutil
@@ -8,9 +9,42 @@ import subprocess
 import tempfile
 import time
 
+logger = logging.getLogger(__name__)
+
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 
 _IS_WINDOWS = platform.system() == "Windows"
+
+
+def _msys_to_windows_path(path: str) -> str | None:
+    """Convert an MSYS2 / Git Bash style path to Windows form.
+
+    /mnt/c/Users/... → C:\\Users\\...
+    /c/Users/...     → C:\\Users\\...
+    """
+    import re
+
+    m = re.match(r"^/(?:mnt/)?([a-zA-Z])(/.*)?$", path)
+    if not m:
+        return None
+    drive = m.group(1).upper()
+    rest = (m.group(2) or "").replace("/", "\\")
+    return f"{drive}:{rest}" if rest else f"{drive}:\\"
+
+
+def _windows_to_msys_path(path: str) -> str | None:
+    """Convert a Windows path to MSYS2 / Git Bash POSIX form.
+
+    C:\\Users\\Admin\\AppData\\Local\\Temp → /c/Users/Admin/AppData/Local/Temp
+    D:\\tmp\\hermes                            → /d/tmp/hermes
+    """
+    import re
+    m = re.match(r"^([a-zA-Z]):[\\/](.*)$", path)
+    if not m:
+        return None
+    drive = m.group(1).lower()
+    rest = m.group(2).replace("\\", "/")
+    return f"/{drive}/{rest}" if rest else f"/{drive}/"
 
 
 # Hermes-internal env vars that should NOT leak into terminal subprocesses.
@@ -312,21 +346,54 @@ class LocalEnvironment(BaseEnvironment):
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         if cwd:
             cwd = os.path.expanduser(cwd)
-        super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        resolved = cwd or os.getcwd()
+        if not os.path.isdir(resolved):
+            fallback = "C:\\" if _IS_WINDOWS else "/"
+            logger.warning(
+                "CWD %r is not a directory, falling back to %r", resolved, fallback
+            )
+            resolved = fallback
+        logger.warning("[CWD-DEBUG] __init__: raw cwd=%r, resolved=%r", cwd, resolved)
+        super().__init__(cwd=resolved, timeout=timeout, env=env)
+        logger.warning("[CWD-DEBUG] __init__: self.cwd=%r after super().__init__", self.cwd)
         self.init_session()
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
 
-        Termux does not provide /tmp by default, but exposes a POSIX TMPDIR.
-        Prefer POSIX-style env vars when available, keep using /tmp on regular
-        Unix systems, and only fall back to tempfile.gettempdir() when it also
-        resolves to a POSIX path.
+        On Windows (Git Bash / MSYS2), the native ``/tmp`` does not exist.
+        We convert the Windows temp directory to its MSYS2-compatible path
+        so that bash subprocesses can write there (e.g. snapshot scripts,
+        CWD marker files).
 
-        Check the environment configured for this backend first so callers can
-        override the temp root explicitly (for example via terminal.env or a
-        custom TMPDIR), then fall back to the host process environment.
+        On Unix, the original logic is preserved: prefer explicit TMPDIR /
+        TMP / TEMP env vars, then ``/tmp``, then ``tempfile.gettempdir()``.
         """
+        # --- Windows: convert Windows temp path to Git-Bash / MSYS2 form ---
+        if _IS_WINDOWS:
+            # 1) Check configured env first (terminal.env or custom TMPDIR)
+            for env_var in ("TMPDIR", "TMP", "TEMP"):
+                candidate = self.env.get(env_var) or os.environ.get(env_var)
+                if candidate:
+                    # Already POSIX-style → use as-is
+                    if candidate.startswith("/"):
+                        return candidate.rstrip("/") or "/"
+                    # Windows path (C:\...) → convert to MSYS2 (/c/Users/...)
+                    converted = _windows_to_msys_path(candidate)
+                    if converted:
+                        logger.debug("[TMP-WIN] env %s=%s → %s", env_var, candidate, converted)
+                        return converted
+            # 2) Fall back to Python's tempfile.gettempdir() → convert
+            win_temp = tempfile.gettempdir()  # e.g. C:\Users\...\AppData\Local\Temp
+            converted = _windows_to_msys_path(win_temp)
+            if converted:
+                logger.debug("[TMP-WIN] tempfile.gettempdir()=%s → %s", win_temp, converted)
+                return converted
+            # 3) Last resort: /tmp (Git Bash usually maps this)
+            logger.warning("[TMP-WIN] Could not convert temp path, falling back to /tmp")
+            return "/tmp"
+
+        # --- Unix / macOS / Termux: original logic ---
         for env_var in ("TMPDIR", "TMP", "TEMP"):
             candidate = self.env.get(env_var) or os.environ.get(env_var)
             if candidate and candidate.startswith("/"):
@@ -358,6 +425,15 @@ class LocalEnvironment(BaseEnvironment):
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
 
+        popen_kwargs: dict = {}
+        if _IS_WINDOWS:
+            # CREATE_NO_WINDOW (0x08000000) prevents the child process
+            # (bash.exe) from creating a new console window.  This is
+            # essential when the parent is pythonw.exe (GUI subsystem)
+            # or when running under a Windows Service context (Session 0)
+            # — without it, the child's pipe I/O can become unreliable.
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
         proc = subprocess.Popen(
             args,
             text=True,
@@ -369,7 +445,9 @@ class LocalEnvironment(BaseEnvironment):
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             preexec_fn=None if _IS_WINDOWS else os.setsid,
             cwd=self.cwd,
+            **popen_kwargs,
         )
+        logger.warning("[CWD-DEBUG] _run_bash: cwd=%r, cmd=%r", self.cwd, args[:3])
         if not _IS_WINDOWS:
             try:
                 proc._hermes_pgid = os.getpgid(proc.pid)
@@ -453,16 +531,49 @@ class LocalEnvironment(BaseEnvironment):
 
     def _update_cwd(self, result: dict):
         """Read CWD from temp file (local-only, no round-trip needed)."""
+        # Step 1: Parse the stdout marker (may set self.cwd to MSYS path like /c)
+        self._extract_cwd_from_output(result)
+        logger.warning("[CWD-DEBUG] _update_cwd: after _extract_cwd_from_output, self.cwd=%r", self.cwd)
+
+        # Step 1b: Convert MSYS2 cwd from marker to Windows path so
+        # subprocess.Popen accepts it on the next execute() call.
+        if _IS_WINDOWS and self.cwd and self.cwd.startswith("/"):
+            converted = _msys_to_windows_path(self.cwd)
+            if converted:
+                logger.warning("[CWD-DEBUG] _update_cwd: converting extracted cwd %r -> %r", self.cwd, converted)
+                self.cwd = converted
+
+        # Step 2: Override with file-based cwd — on Windows the file path
+        # may be MSYS2-style (/c/Users/...) from get_temp_dir(), so convert
+        # it to a real Windows path for Python open().
+        cwd_file = self._cwd_file
+        if _IS_WINDOWS and cwd_file.startswith("/"):
+            win_cwd_file = _msys_to_windows_path(cwd_file)
+            if win_cwd_file:
+                cwd_file = win_cwd_file
+                logger.warning("[CWD-DEBUG] _update_cwd: converted cwd_file %r -> %r", self._cwd_file, cwd_file)
         try:
-            with open(self._cwd_file) as f:
+            with open(cwd_file) as f:
                 cwd_path = f.read().strip()
-            if cwd_path:
+            logger.warning("[CWD-DEBUG] _update_cwd: cwd_file=%r, raw content=%r", cwd_file, cwd_path)
+            if cwd_path and os.path.isdir(cwd_path):
                 self.cwd = cwd_path
-        except (OSError, FileNotFoundError):
+                logger.warning("[CWD-DEBUG] _update_cwd: set self.cwd from file (isdir check): %r", self.cwd)
+            elif cwd_path and _IS_WINDOWS:
+                converted = _msys_to_windows_path(cwd_path)
+                logger.warning("[CWD-DEBUG] _update_cwd: isdir failed, _msys_to_windows_path(%r)=%r", cwd_path, converted)
+                if converted and os.path.isdir(converted):
+                    self.cwd = converted
+                    logger.warning("[CWD-DEBUG] _update_cwd: set self.cwd from converted: %r", self.cwd)
+                else:
+                    logger.warning("[CWD-DEBUG] _update_cwd: converted=%r is not a dir or None, self.cwd REMAINS=%r", converted, self.cwd)
+            else:
+                logger.warning("[CWD-DEBUG] _update_cwd: cwd_path empty or not dir, self.cwd REMAINS=%r", self.cwd)
+        except (OSError, FileNotFoundError) as e:
+            logger.warning("[CWD-DEBUG] _update_cwd: file read failed: %s, self.cwd REMAINS=%r", e, self.cwd)
             pass
 
-        # Still strip the marker from output so it's not visible
-        self._extract_cwd_from_output(result)
+        logger.warning("[CWD-DEBUG] _update_cwd FINAL: self.cwd=%r", self.cwd)
 
     def cleanup(self):
         """Clean up temp files."""
