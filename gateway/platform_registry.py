@@ -110,6 +110,14 @@ class PlatformEntry:
     # Do not use markdown.").  Empty string = no hint.
     platform_hint: str = ""
 
+    # ── Plugin extension fields ──
+    # Optional env-driven auto-enablement function.
+    env_enablement_fn: Optional[Callable[[], bool]] = None
+    # Env var name for cron home-channel delivery target.
+    cron_deliver_env_var: str = ""
+    # Optional function to send a message out-of-process (for cron).
+    standalone_sender_fn: Optional[Callable] = None
+
 
 class PlatformRegistry:
     """Central registry of platform adapters.
