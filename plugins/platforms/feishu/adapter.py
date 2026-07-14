@@ -228,19 +228,6 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "always": "Approved permanently",
     "deny": "Denied",
 }
-
-
-async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> bytes:
-    """Read at most ``max_bytes`` from an aiohttp request body."""
-    try:
-        body = await request.content.readexactly(max_bytes + 1)
-    except asyncio.IncompleteReadError as exc:
-        body = exc.partial
-    if len(body) > max_bytes:
-        raise ValueError("payload too large")
-    return body
-
-
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 
@@ -409,6 +396,9 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    # user_ids / open_ids whose messages inside a topic (thread) reply without
+    # needing an explicit @mention. Read from FEISHU_TOPIC_BYPASS_USERS (CSV).
+    topic_bypass_users: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -559,6 +549,164 @@ def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
 
 # ---------------------------------------------------------------------------
 # Post payload builders and parsers
+# ---------------------------------------------------------------------------
+# Markdown table → interactive card (port from gateway/platforms/feishu.py PR #9640)
+# ---------------------------------------------------------------------------
+
+_TABLE_ROW_RE = re.compile(r"^\s*\|", re.MULTILINE)
+_MAX_TABLES_PER_CARD = 5
+_FEISHU_DONE_EMOJI = "DONE"
+
+
+def _parse_md_table(table_lines: List[str]) -> Optional[Dict[str, Any]]:
+    """Parse GFM table lines into a Feishu native table component dict."""
+    lines = [ln for ln in table_lines if ln.strip()]
+    if len(lines) < 2:
+        return None
+    sep_idx = None
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*\|[\s\-\:|\:]+\|\s*$", ln):
+            sep_idx = i
+            break
+    if sep_idx is None or sep_idx == 0:
+        return None
+
+    def split_row(line: str) -> List[str]:
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            stripped = stripped[1:]
+        if stripped.endswith("|"):
+            stripped = stripped[:-1]
+        return [c.strip() for c in stripped.split("|")]
+
+    def clean_text(text: str) -> str:
+        """Strip markdown bold/italic markers, backticks, and map[content:...] artifacts."""
+        text = re.sub(r"[*_]{1,2}(.+?)[*_]{1,2}", r"\1", text)
+        text = text.replace("`", "")
+        text = re.sub(r"map\[content:\s*(.*?)\s*tag:lark_md\]", r"\1", text)
+        return text
+
+    headers = [clean_text(h) for h in split_row(lines[0])]
+    if not headers:
+        return None
+    col_keys = [f"col{i}" for i in range(len(headers))]
+
+    columns = [
+        {
+            "name": col_keys[i],
+            "display_name": headers[i],
+            "data_type": "text",
+            "width": "auto",
+        }
+        for i in range(len(headers))
+    ]
+
+    rows = []
+    for line in lines[sep_idx + 1 :]:
+        cells = split_row(line)
+        row: Dict[str, Any] = {}
+        for i, key in enumerate(col_keys):
+            cell_text = clean_text(cells[i]) if i < len(cells) else ""
+            row[key] = cell_text or " "
+        rows.append(row)
+
+    if not rows:
+        return None
+
+    return {
+        "tag": "table",
+        "columns": columns,
+        "rows": rows,
+        "header_style": {
+            "bold": True,
+            "text_align": "left",
+            "text_size": "normal",
+            "background_style": "none",
+            "text_color": "default",
+            "lines": 1,
+        },
+    }
+
+
+def _convert_md_headings_to_bold(text: str) -> str:
+    """Convert Markdown headings (##, ###, etc.) to bold text."""
+    return re.sub(r"^#{1,6}\s+(.+)$", r"**\1**", text, flags=re.MULTILINE)
+
+
+def _build_card_elements(text: str) -> List[Dict[str, Any]]:
+    """Parse text into a list of card elements (table or markdown)."""
+    lines = text.split("\n")
+    elements: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _TABLE_ROW_RE.match(line):
+            table_block: List[str] = []
+            while i < len(lines) and _TABLE_ROW_RE.match(lines[i]):
+                table_block.append(lines[i])
+                i += 1
+            table_elem = _parse_md_table(table_block)
+            if table_elem:
+                elements.append(table_elem)
+            else:
+                fallback = _convert_md_headings_to_bold("\n".join(table_block))
+                elements.append({"tag": "markdown", "content": fallback})
+        else:
+            text_block: List[str] = []
+            while i < len(lines) and not _TABLE_ROW_RE.match(lines[i]):
+                text_block.append(lines[i])
+                i += 1
+            content = "\n".join(text_block).strip()
+            if content:
+                content = _convert_md_headings_to_bold(content)
+                elements.append({"tag": "markdown", "content": content})
+    if not elements:
+        elements = [{"tag": "markdown", "content": _convert_md_headings_to_bold(text)}]
+    return elements
+
+
+def _split_card_elements(elements: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Split elements into chunks, each with at most _MAX_TABLES_PER_CARD tables."""
+    chunks: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    pending: List[Dict[str, Any]] = []
+    table_count = 0
+    for elem in elements:
+        if elem.get("tag") == "table":
+            if table_count >= _MAX_TABLES_PER_CARD:
+                chunks.append(current)
+                current = list(pending)
+                table_count = 0
+            else:
+                current.extend(pending)
+            pending = []
+            current.append(elem)
+            table_count += 1
+        else:
+            pending.append(elem)
+    current.extend(pending)
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _build_interactive_payload_chunks(text: str) -> List[str]:
+    """Build card JSONs, split when table count exceeds the limit."""
+    elements = _build_card_elements(text)
+    chunks = _split_card_elements(elements)
+    return [
+        json.dumps(
+            {"config": {"wide_screen_mode": True}, "elements": chunk}, ensure_ascii=False
+        )
+        for chunk in chunks
+    ]
+
+
+def _has_table(content: str) -> bool:
+    """Check if content contains a markdown table."""
+    return bool(_TABLE_ROW_RE.search(content))
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -1600,6 +1748,11 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            topic_bypass_users=frozenset(
+                item.strip()
+                for item in os.getenv("FEISHU_TOPIC_BYPASS_USERS", "").split(",")
+                if item.strip()
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1632,6 +1785,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._topic_bypass_users = set(settings.topic_bypass_users)
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -1769,49 +1923,10 @@ class FeishuAdapter(BasePlatformAdapter):
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
-
-        # Send a WebSocket CLOSE frame to Feishu BEFORE tearing down the
-        # thread loop. Without this, Feishu's server never learns the
-        # connection is dead and continues routing messages to the stale
-        # endpoint — the channel goes silent until the server-side
-        # CLOSE-WAIT expires (minutes to hours). See issue #10202.
-        #
-        # ``_disable_websocket_auto_reconnect()`` nils ``self._ws_client``,
-        # so capture the client reference first.
-        ws_client = self._ws_client
-        ws_thread_loop = self._ws_thread_loop
         self._disable_websocket_auto_reconnect()
         await self._stop_webhook_server()
 
-        if (
-            ws_client is not None
-            and ws_thread_loop is not None
-            and not ws_thread_loop.is_closed()
-            and hasattr(ws_client, "_disconnect")
-        ):
-            try:
-                future = asyncio.run_coroutine_threadsafe(
-                    ws_client._disconnect(), ws_thread_loop
-                )
-                # 5s is generous — the CLOSE frame is a single WebSocket
-                # control frame. If it takes longer than that the
-                # connection is already wedged and we gain nothing by
-                # waiting further.
-                await asyncio.wait_for(asyncio.wrap_future(future), timeout=5.0)
-                logger.debug("[Feishu] Sent WebSocket CLOSE frame to Feishu")
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[Feishu] CLOSE frame not acknowledged within 5s — "
-                    "Feishu may briefly route messages to the stale "
-                    "connection until server-side timeout"
-                )
-            except Exception as exc:
-                logger.debug(
-                    "[Feishu] Could not send WebSocket CLOSE frame: %s",
-                    exc,
-                    exc_info=True,
-                )
-
+        ws_thread_loop = self._ws_thread_loop
         if ws_thread_loop is not None and not ws_thread_loop.is_closed():
             logger.debug("[Feishu] Cancelling websocket thread tasks and stopping loop")
 
@@ -1884,6 +1999,37 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound — send / edit / send_image / send_voice / …
     # =========================================================================
 
+    def _apply_native_footer(self, msg_type: str, payload: str, footer: str) -> str:
+        """Inject runtime footer as native Feishu element per msg_type.
+
+        For interactive cards: hr separator + note element at the bottom.
+        For post content:     appended paragraph with plain_text.
+        For plain text:       appended with double newline separator.
+        """
+        if not footer:
+            return payload
+        if msg_type == "interactive":
+            card = json.loads(payload)
+            elements = card.setdefault("elements", [])
+            elements.append({"tag": "hr"})
+            elements.append(
+                {"tag": "note", "elements": [{"tag": "plain_text", "content": footer}]}
+            )
+            return json.dumps(card, ensure_ascii=False)
+        if msg_type == "post":
+            post = json.loads(payload)
+            zh_cn = post.setdefault("zh_cn", {})
+            zh_cn.setdefault("content", []).append(
+                {"tag": "paragraph", "elements": [{"tag": "plain_text", "content": footer}]}
+            )
+            return json.dumps(post, ensure_ascii=False)
+        if msg_type == "text":
+            text_obj = json.loads(payload)
+            old_text = text_obj.get("text") or ""
+            text_obj["text"] = f"{old_text}\n\n{footer}"
+            return json.dumps(text_obj, ensure_ascii=False)
+        return payload
+
     async def send(
         self,
         chat_id: str,
@@ -1895,13 +2041,21 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        _rf_footer = (metadata or {}).get("_runtime_footer") if metadata else None
+
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
 
         try:
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
                 msg_type, payload = self._build_outbound_payload(chunk)
+                _is_last = i == len(chunks) - 1
+
+                # Apply native footer to the last chunk
+                if _rf_footer and _is_last:
+                    payload = self._apply_native_footer(msg_type, payload, _rf_footer)
+
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -1914,10 +2068,13 @@ class FeishuAdapter(BasePlatformAdapter):
                     if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
                         raise
                     logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                    _fallback_text = _strip_markdown_to_plain_text(chunk)
+                    if _rf_footer and _is_last:
+                        _fallback_text += f"\n\n{_rf_footer}"
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        payload=json.dumps({"text": _fallback_text}, ensure_ascii=False),
                         reply_to=reply_to,
                         metadata=metadata,
                     )
@@ -1927,10 +2084,13 @@ class FeishuAdapter(BasePlatformAdapter):
                     and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
                 ):
                     logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
+                    _fallback_text = _strip_markdown_to_plain_text(chunk)
+                    if _rf_footer and _is_last:
+                        _fallback_text += f"\n\n{_rf_footer}"
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        payload=json.dumps({"text": _fallback_text}, ensure_ascii=False),
                         reply_to=reply_to,
                         metadata=metadata,
                     )
@@ -1980,8 +2140,6 @@ class FeishuAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
-        allow_permanent: bool = True,
-        smart_denied: bool = False,
     ) -> SendResult:
         """Send an interactive card with approval buttons.
 
@@ -2004,13 +2162,6 @@ class FeishuAdapter(BasePlatformAdapter):
                     "value": {"hermes_action": action_name, "approval_id": approval_id},
                 }
 
-            actions = [_btn("✅ Allow Once", "approve_once", "primary")]
-            if not smart_denied:
-                actions.append(_btn("✅ Session", "approve_session"))
-                if allow_permanent:
-                    actions.append(_btn("✅ Always", "approve_always"))
-            actions.append(_btn("❌ Deny", "deny", "danger"))
-            scope_note = "\n\n**Smart DENY:** owner override applies to this one operation only." if smart_denied else ""
             card = {
                 "config": {"wide_screen_mode": True},
                 "header": {
@@ -2020,11 +2171,16 @@ class FeishuAdapter(BasePlatformAdapter):
                 "elements": [
                     {
                         "tag": "markdown",
-                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}{scope_note}",
+                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
                     },
                     {
                         "tag": "action",
-                        "actions": actions,
+                        "actions": [
+                            _btn("✅ Allow Once", "approve_once", "primary"),
+                            _btn("✅ Session", "approve_session"),
+                            _btn("✅ Always", "approve_always"),
+                            _btn("❌ Deny", "deny", "danger"),
+                        ],
                     },
                 ],
             }
@@ -2948,7 +3104,6 @@ class FeishuAdapter(BasePlatformAdapter):
             source=source,
             raw_message=data,
             message_id=message_id,
-            channel_prompt=self._resolve_channel_prompt(chat_id),
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
@@ -3011,7 +3166,6 @@ class FeishuAdapter(BasePlatformAdapter):
             source=source,
             raw_message=data,
             message_id=token or str(uuid.uuid4()),
-            channel_prompt=self._resolve_channel_prompt(chat_id),
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
@@ -3175,6 +3329,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         if outcome is ProcessingOutcome.FAILURE:
             await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
+        else:
+            await self._add_reaction(message_id, _FEISHU_DONE_EMOJI)
 
     # =========================================================================
     # Webhook server and security
@@ -3213,18 +3369,6 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
     # Inbound processing pipeline
     # =========================================================================
-
-    def _resolve_channel_prompt(self, chat_id: str, parent_id: str | None = None) -> str | None:
-        """Resolve a Feishu per-channel system prompt.
-
-        Mirrors the Discord/Slack behaviour so ``channel_prompts: {<chat_id>:
-        "<prompt>"}`` in ``PlatformConfig.extra`` is honoured for Feishu chats
-        instead of being silently ignored.
-        """
-        from gateway.platforms.base import resolve_channel_prompt
-        _config = getattr(self, "config", None)
-        _extra = getattr(_config, "extra", None) or {}
-        return resolve_channel_prompt(_extra, chat_id, parent_id)
 
     async def _process_inbound_message(
         self,
@@ -3303,7 +3447,6 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
-            channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
             timestamp=datetime.now(),
         )
         await self._dispatch_inbound_event(normalized)
@@ -3484,16 +3627,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             body_bytes: bytes = await asyncio.wait_for(
-                _read_limited_feishu_webhook_body(
-                    request,
-                    _FEISHU_WEBHOOK_MAX_BODY_BYTES,
-                ),
+                request.read(),
                 timeout=_FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS,
             )
-        except ValueError:
-            logger.warning("[Feishu] Webhook body exceeds limit from %s", remote_ip)
-            self._record_webhook_anomaly(remote_ip, "413")
-            return web.Response(status=413, text="Request body too large")
         except asyncio.TimeoutError:
             logger.warning("[Feishu] Webhook body read timed out after %ds from %s", _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS, remote_ip)
             self._record_webhook_anomaly(remote_ip, "408")
@@ -3501,6 +3637,11 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             self._record_webhook_anomaly(remote_ip, "400")
             return web.json_response({"code": 400, "msg": "failed to read body"}, status=400)
+
+        if len(body_bytes) > _FEISHU_WEBHOOK_MAX_BODY_BYTES:
+            logger.warning("[Feishu] Webhook body exceeds limit (%d bytes) from %s", len(body_bytes), remote_ip)
+            self._record_webhook_anomaly(remote_ip, "413")
+            return web.Response(status=413, text="Request body too large")
 
         try:
             payload = json.loads(body_bytes.decode("utf-8"))
@@ -4258,17 +4399,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 return "bot_not_mentioned"
 
         if not is_group:
-            if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
-                return None
-            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
-                return None
-            # Empty FEISHU_ALLOWED_USERS is the pairing-mode default from setup:
-            # forward DMs to gateway intake so the pairing handshake can run.
-            # Gateway auth fail-closes agent access until approval.
-            if not self._allowed_group_users:
-                return None
-            if not (sender_ids and (sender_ids & self._allowed_group_users)):
-                return "dm_policy_rejected"
             return None
 
         if not self._allow_group_message(
@@ -4276,6 +4406,10 @@ class FeishuAdapter(BasePlatformAdapter):
         ):
             return "group_policy_rejected"
         if require_mention and not self._mentions_self(message):
+            # In a topic (thread), allow listed users to trigger without an @mention
+            thread_id = getattr(message, "thread_id", None) or None
+            if thread_id and (sender_ids & self._topic_bypass_users):
+                return None
             return "group_policy_rejected"
         return None
 
@@ -4526,10 +4660,15 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Feishu post-type 'md' elements do not render markdown tables; sending
-        # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
-        if _MARKDOWN_TABLE_RE.search(content):
+        # Content with a markdown table → send as an interactive card so the
+        # table renders as a native Feishu component (PR #9640 port).
+        if _has_table(content):
+            chunks = _build_interactive_payload_chunks(content)
+            if len(chunks) == 1:
+                return "interactive", chunks[0]
+            # Multi-chunk (>= 5 tables in one message): fall back to plain
+            # text so the user still sees the content. The chunked-send
+            # path would require a richer return type that's not in scope.
             text_payload = {"text": content}
             return "text", json.dumps(text_payload, ensure_ascii=False)
         if _MARKDOWN_HINT_RE.search(content):
@@ -4734,12 +4873,6 @@ class FeishuAdapter(BasePlatformAdapter):
             log_level=lark.LogLevel.INFO,
             event_handler=self._event_handler,
             domain=domain,
-            # Channel SDK signaling tag: without this UA tag the Feishu
-            # server does not push group @mention events over the WebSocket
-            # transport.  The tag tells the server to use the Channel protocol
-            # which enables group-message routing in addition to P2P DM.
-            # See https://github.com/NousResearch/hermes-agent/issues/50656
-            extra_ua_tags=["channel"],
         )
         self._ws_future = loop.run_in_executor(
             None,
@@ -4757,10 +4890,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if self._event_handler is None:
             raise RuntimeError("failed to build Feishu event handler")
         await self._hydrate_bot_identity()
-        # client_max_size backstops the bounded reader in
-        # _handle_webhook_request; aiohttp then enforces the same cap on
-        # every read path (#58536/#58902/#59180 pattern).
-        app = web.Application(client_max_size=_FEISHU_WEBHOOK_MAX_BODY_BYTES)
+        app = web.Application()
         app.router.add_post(self._webhook_path, self._handle_webhook_request)
         self._webhook_runner = web.AppRunner(app)
         await self._webhook_runner.setup()
