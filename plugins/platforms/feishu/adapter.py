@@ -2140,6 +2140,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        smart_denied: bool = False,
     ) -> SendResult:
         """Send an interactive card with approval buttons.
 
@@ -2162,6 +2164,13 @@ class FeishuAdapter(BasePlatformAdapter):
                     "value": {"hermes_action": action_name, "approval_id": approval_id},
                 }
 
+            actions = [_btn("✅ Allow Once", "approve_once", "primary")]
+            if not smart_denied:
+                actions.append(_btn("✅ Session", "approve_session"))
+                if allow_permanent:
+                    actions.append(_btn("✅ Always", "approve_always"))
+            actions.append(_btn("❌ Deny", "deny", "danger"))
+            scope_note = "\n\n**Smart DENY:** owner override applies to this one operation only." if smart_denied else ""
             card = {
                 "config": {"wide_screen_mode": True},
                 "header": {
@@ -2171,16 +2180,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 "elements": [
                     {
                         "tag": "markdown",
-                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
+                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}{scope_note}",
                     },
                     {
                         "tag": "action",
-                        "actions": [
-                            _btn("✅ Allow Once", "approve_once", "primary"),
-                            _btn("✅ Session", "approve_session"),
-                            _btn("✅ Always", "approve_always"),
-                            _btn("❌ Deny", "deny", "danger"),
-                        ],
+                        "actions": actions,
                     },
                 ],
             }
