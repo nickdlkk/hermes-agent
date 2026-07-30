@@ -28,7 +28,7 @@ from __future__ import annotations
 import os
 from typing import Any, Iterable, Optional
 
-_DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
+_DEFAULT_FIELDS: tuple[str, ...] = ("model", "api_calls", "context_pct", "compressions", "cwd")
 _SEP = " · "
 
 
@@ -91,8 +91,10 @@ def resolve_footer_config(
 def format_runtime_footer(
     *,
     model: Optional[str],
-    context_tokens: int,
-    context_length: Optional[int],
+    context_tokens: int = 0,
+    context_length: Optional[int] = None,
+    api_calls: Optional[int] = None,
+    compressions: Optional[int] = None,
     cwd: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
@@ -107,10 +109,16 @@ def format_runtime_footer(
             m = _model_short(model)
             if m:
                 parts.append(m)
+        elif field == "api_calls":
+            if api_calls is not None and api_calls > 0:
+                parts.append(f"api:{api_calls}")
         elif field == "context_pct":
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
-                parts.append(f"{pct}%")
+                parts.append(f"ctx:{pct}%")
+        elif field == "compressions":
+            if compressions is not None and compressions > 0:
+                parts.append(f"comp:{compressions}")
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
@@ -129,6 +137,8 @@ def build_footer_line(
     model: Optional[str],
     context_tokens: int,
     context_length: Optional[int],
+    api_calls: Optional[int] = None,
+    compressions: Optional[int] = None,
     cwd: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
@@ -144,6 +154,8 @@ def build_footer_line(
         model=model,
         context_tokens=context_tokens,
         context_length=context_length,
+        api_calls=api_calls,
+        compressions=compressions,
         cwd=cwd,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
