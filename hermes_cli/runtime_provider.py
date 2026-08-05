@@ -466,14 +466,19 @@ def _resolve_runtime_from_pool_entry(
     elif provider == "qwen-oauth":
         api_mode = "chat_completions"
         base_url = base_url or DEFAULT_QWEN_BASE_URL
-    elif provider == "minimax-oauth":
-        # MiniMax OAuth tokens are valid only against the Anthropic Messages
-        # compatible endpoint. Do not honor stale model.api_mode values from a
-        # prior OpenAI-compatible provider, or the client will hit
-        # /chat/completions under /anthropic and receive a bare nginx 404.
+    elif provider in {"minimax-oauth", "minimax", "minimax-cn"}:
+        # MiniMax main-agent traffic uses the Anthropic Messages-compatible
+        # endpoint. Do not honor stale /v1 pool bases here: those belong to the
+        # OpenAI-compatible surface used by auxiliary clients and lead to bare
+        # 404s when the Anthropic SDK appends /v1/messages.  Pin runtime
+        # resolution to the provider's declared inference base unless the pool
+        # entry already carries an /anthropic URL.
         api_mode = "anthropic_messages"
         pconfig = PROVIDER_REGISTRY.get(provider)
-        base_url = base_url or (pconfig.inference_base_url if pconfig else "")
+        if not base_url or base_url.rstrip("/").endswith("/v1"):
+            base_url = pconfig.inference_base_url if pconfig else base_url
+        elif pconfig and base_url.rstrip("/") == pconfig.inference_base_url.rstrip("/"):
+            base_url = pconfig.inference_base_url
     elif provider == "anthropic":
         api_mode = "anthropic_messages"
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
